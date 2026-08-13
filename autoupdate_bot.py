@@ -117,7 +117,7 @@ def get_running_docker_images() -> list[str]:
     valid_images = []
     for line in out.split("\n"):
         img = line.strip()
-        # 排除空行或虚悬镜像
+        # 排除空行或虚悬镜像 <none>
         if img and "<none>" not in img:
             if ":" not in img.split("/")[-1]:
                 img = f"{img}:latest"
@@ -133,7 +133,7 @@ def get_image_digest(image_name: str) -> str:
 
 
 def build_scan_keyboard(chat_id: str) -> InlineKeyboardMarkup:
-    """构建扫描镜像勾选菜单 (解决 64 字节限制问题)"""
+    """构建扫描镜像勾选菜单 (解决 Telegram 64 字节 callback_data 限制)"""
     state = scan_temp_state.get(chat_id, {})
     keyboard = []
 
@@ -297,16 +297,28 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     save_tasks_to_disk()
-    await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="🚀 正在覆盖更新...", parse_mode="Markdown")
+    await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="🚀 *[2/4] 正在从 GitHub 覆盖源码...*", parse_mode="Markdown")
 
     code1, _ = run_cmd(f"curl -fsSL {GITHUB_RAW_URL}/autoupdate_bot.py -o {DATA_DIR}/autoupdate_bot.py")
     if code1 != 0:
         await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 下载失败，请检查仓库路径。")
         return
 
+    # 写入新版本 SHA Hash
     with open(VERSION_FILE, "w") as f: f.write(remote_sha)
+
+    # 编辑消息通知用户更新完成
+    await context.bot.edit_message_text(
+        chat_id=ALLOWED_CHAT_ID, 
+        message_id=msg.message_id, 
+        text=f"✅ *[4/4] 升级成功！*\n📌 当前版本 Commit: `{remote_sha}`\n🔄 服务正在后台平滑重启...", 
+        parse_mode="Markdown"
+    )
+
     await asyncio.sleep(1)
-    run_cmd("systemctl restart docker-update-bot.service")
+
+    # 脱离当前 Cgroup 域非阻塞异步触发 restart，解决死锁挂起问题
+    os.system("systemd-run --scope --user=root systemctl restart docker-update-bot.service &")
 
 
 async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
