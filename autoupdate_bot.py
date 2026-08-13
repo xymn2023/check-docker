@@ -179,7 +179,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /scan - 扫描当前运行的 Docker 镜像并设置监控\n"
         "• /check - 立即触发一轮镜像更新巡检\n"
         "• /status - 查看当前监控池与系统运行状态\n"
-        "• /update - 自动升级 Bot 程序源码",
+        "• /update - 强制升级并重启 Bot 程序",
         parse_mode="Markdown"
     )
 
@@ -274,7 +274,7 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_is_owner(update): return
     msg = await update.message.reply_text("🔎 *⚙️ [1/4] 正在连接 GitHub API 校验远程代码版本...*", parse_mode="Markdown")
 
-    # 1. 增加 -m 10 超时控制，防止死等
+    # 1. 连接 API 获取远程 SHA (10 秒超时)[cite: 1, 2]
     code, api_out = run_cmd(f"curl -s -m 10 {GITHUB_API_URL}")
     if code != 0 or '"sha"' not in api_out:
         await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 无法连接 GitHub API 或网络超时，更新已取消。")
@@ -297,27 +297,30 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     save_tasks_to_disk()
-    await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text=f"🚀 *⚙️ [2/4] 检测到新版本 ({remote_sha})，正在拉取最新源码...*", parse_mode="Markdown")
+    await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text=f"🚀 *⚙️ [2/4] 检测到新版本 ({remote_sha})，正在强制拉取源码...*", parse_mode="Markdown")
 
-    # 2. 增加 -m 15 超时限制，防止在覆盖时卡死
+    # 2. 强制覆盖源码文件 (15 秒超时)[cite: 1, 2]
     code1, _ = run_cmd(f"curl -fsSL -m 15 {GITHUB_RAW_URL}/autoupdate_bot.py -o {DATA_DIR}/autoupdate_bot.py")
     if code1 != 0:
-        await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 源码拉取失败，请检查服务器连接 GitHub RAW 的网络状态。")
+        await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 源码拉取失败，请检查服务器网络状态。")
         return
 
+    # 3. 记录最新 SHA
     with open(VERSION_FILE, "w") as f: f.write(remote_sha)
 
+    # 4. 率先通知 Telegram，告知完成并即将强杀进程[cite: 1, 2]
     await context.bot.edit_message_text(
         chat_id=ALLOWED_CHAT_ID,
         message_id=msg.message_id,
-        text=f"⚙️ *[3/4] 代码覆盖成功！*\n🔄 正在请求 Systemd 重启服务，请稍候...",
+        text=f"✅ *⚙️ [3/3] 覆盖完成！*\n📌 当前版本: `{remote_sha}`\n💀 正在强杀当前进程，Systemd 将立即启动新版本...",
         parse_mode="Markdown"
     )
 
+    # 缓冲 1 秒确保消息发送完成[cite: 1, 2]
     await asyncio.sleep(1)
 
-    # 3. 关键修正：异步后台触发 restart，避免阻塞主程序，彻底解决卡死在 [3/4]
-    os.system("systemd-run --scope --user=root systemctl restart docker-update-bot.service &")
+    # 5. 💥 物理强杀：直接 KILL 掉当前 PID，靠 Systemd 的 Restart=always 瞬间拉起新进程[cite: 1, 2]
+    os.system(f"kill -9 {os.getpid()}")
 
 
 async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
