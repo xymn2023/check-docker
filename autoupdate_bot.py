@@ -27,6 +27,7 @@ DATA_DIR = "/opt/docker-update-bot"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
 VERSION_FILE = os.path.join(DATA_DIR, ".version")
+UPDATING_MARKER_FILE = os.path.join(DATA_DIR, ".updating_msg")  # 重启真实校验标记
 
 # GitHub 仓库源码路径
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/xymn2023/check-docker/main"
@@ -117,7 +118,6 @@ def get_running_docker_images() -> list[str]:
     valid_images = []
     for line in out.split("\n"):
         img = line.strip()
-        # 排除空行或虚悬镜像
         if img and "<none>" not in img:
             if ":" not in img.split("/")[-1]:
                 img = f"{img}:latest"
@@ -133,7 +133,7 @@ def get_image_digest(image_name: str) -> str:
 
 
 def build_scan_keyboard(chat_id: str) -> InlineKeyboardMarkup:
-    """构建扫描镜像勾选菜单 (通过索引 key 解决长镜像名称超长限制问题)"""
+    """构建扫描镜像勾选菜单"""
     state = scan_temp_state.get(chat_id, {})
     keyboard = []
 
@@ -274,7 +274,7 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_is_owner(update): return
     msg = await update.message.reply_text("🔎 *⚙️ [1/4] 正在连接 GitHub API 校验远程代码版本...*", parse_mode="Markdown")
 
-    # 1. 连接 API 获取远程 SHA (10 秒超时)[cite: 1, 2]
+    # 1. 检查 API 版本 (10 秒超时)[cite: 1, 2]
     code, api_out = run_cmd(f"curl -s -m 10 {GITHUB_API_URL}")
     if code != 0 or '"sha"' not in api_out:
         await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 无法连接 GitHub API 或网络超时，更新已取消。")
@@ -297,9 +297,9 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     save_tasks_to_disk()
-    await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text=f"🚀 *⚙️ [2/4] 检测到新版本 ({remote_sha})，正在强制拉取源码...*", parse_mode="Markdown")
+    await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text=f"🚀 *⚙️ [2/4] 检测到新版本 ({remote_sha})，正在拉取最新源码...*", parse_mode="Markdown")
 
-    # 2. 强制覆盖源码文件 (15 秒超时)[cite: 1, 2]
+    # 2. 覆盖源码 (15 秒超时)[cite: 1, 2]
     code1, _ = run_cmd(f"curl -fsSL -m 15 {GITHUB_RAW_URL}/autoupdate_bot.py -o {DATA_DIR}/autoupdate_bot.py")
     if code1 != 0:
         await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 源码拉取失败，请检查服务器网络状态。")
@@ -308,19 +308,31 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3. 记录最新 SHA
     with open(VERSION_FILE, "w") as f: f.write(remote_sha)
 
-    # 4. 率先通知 Telegram，告知完成并即将强杀进程[cite: 1, 2]
+    # 4. 写入强校验标记文件[cite: 1, 2]
+    try:
+        with open(UPDATING_MARKER_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "chat_id": ALLOWED_CHAT_ID,
+                "message_id": msg.message_id,
+                "sha": remote_sha,
+                "old_pid": os.getpid(),
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }, f)
+    except Exception as e:
+        logging.error(f"写入标记文件失败: {e}")
+
+    # 5. 修改消息提示正准备交给 Systemd 真实的物理拉起[cite: 1, 2]
     await context.bot.edit_message_text(
         chat_id=ALLOWED_CHAT_ID,
         message_id=msg.message_id,
-        text=f"✅ *⚙️ [3/3] 覆盖完成！*\n📌 当前版本: `{remote_sha}`\n💀 正在强杀当前进程，Systemd 将立即启动新版本...",
+        text=f"⚙️ *[3/4] 代码已覆盖！*\n🔄 正在请求 Systemd 物理重启服务，请等待新进程就绪...",
         parse_mode="Markdown"
     )
 
-    # 缓冲 1 秒确保消息发送完成[cite: 1, 2]
     await asyncio.sleep(1)
 
-    # 5. 💥 物理强杀：直接 KILL 掉当前 PID，靠 Systemd 的 Restart=always 瞬间拉起新进程[cite: 1, 2]
-    os.system(f"kill -9 {os.getpid()}")
+    # 6. 使用 nohup 异步在独立的 Shell 环境中真实重启 Systemd，规避死锁[cite: 1, 2]
+    os.system("nohup systemctl restart docker-update-bot.service >/dev/null 2>&1 &")
 
 
 async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
@@ -394,6 +406,42 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application):
     load_tasks_from_disk()
+
+    # 💡 真实重启校验逻辑：新进程启动后现场采样并汇报真实系统信息[cite: 1, 2]
+    if os.path.exists(UPDATING_MARKER_FILE):
+        try:
+            with open(UPDATING_MARKER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            chat_id = data.get("chat_id")
+            message_id = data.get("message_id")
+            sha = data.get("sha", "unknown")
+            old_pid = data.get("old_pid", "unknown")
+            new_pid = os.getpid()
+
+            # 真实测量环境状态
+            docker_status = "🟢 正常" if check_docker_daemon() else "🔴 异常"
+
+            # 真实反馈：输出新老 PID 变化证明原进程已被真实杀死，新进程装载成功！[cite: 1, 2]
+            await application.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=(
+                    f"🎉 *[4/4] Systemd 服务真实重启成功！*\n-----------------------------\n"
+                    f"📌 Commit Hash: `{sha}`\n"
+                    f"💀 旧进程 PID: `{old_pid}` (已销毁)\n"
+                    f"🚀 新进程 PID: `{new_pid}` (运行中)\n"
+                    f"⚙️ Docker 环境: *{docker_status}*\n"
+                    f"⏱️ 启动时间: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"发送重启成功真实反馈失败: {e}")
+        finally:
+            if os.path.exists(UPDATING_MARKER_FILE):
+                os.remove(UPDATING_MARKER_FILE)
+
     await application.bot.set_my_commands([
         BotCommand("scan", "扫描容器镜像"),
         BotCommand("check", "检测镜像更新"),
