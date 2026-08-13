@@ -117,7 +117,7 @@ def get_running_docker_images() -> list[str]:
     valid_images = []
     for line in out.split("\n"):
         img = line.strip()
-        # 排除空行或虚悬镜像 <none>
+        # 排除空行或虚悬镜像
         if img and "<none>" not in img:
             if ":" not in img.split("/")[-1]:
                 img = f"{img}:latest"
@@ -133,13 +133,12 @@ def get_image_digest(image_name: str) -> str:
 
 
 def build_scan_keyboard(chat_id: str) -> InlineKeyboardMarkup:
-    """构建扫描镜像勾选菜单 (解决 Telegram 64 字节 callback_data 限制)"""
+    """构建扫描镜像勾选菜单 (通过索引 key 解决长镜像名称超长限制问题)"""
     state = scan_temp_state.get(chat_id, {})
     keyboard = []
 
     for idx, (img, checked) in enumerate(state.items()):
         icon = "☑️" if checked else "⬜"
-        # 使用索引 idx 规避 Telegram callback_data 64 字节超长限制
         keyboard.append([InlineKeyboardButton(f"{icon} {img}", callback_data=f"toggle:{idx}")])
 
     keyboard.append([
@@ -211,7 +210,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.edit_message_text(
         chat_id=chat_id,
         message_id=msg.message_id,
-        text=f"🔍 *实时扫描到当前运行中 {len(current_running_images)} 个标准镜像*\n\n请勾选需要自动检测更新的镜像：",
+        text=f"🔍 *实时扫描到当前运行中 {len(current_running_images)} 个标准镜像*\n\n(已自动剔除隐式 ID 与悬空镜像)\n请勾选需要自动检测更新的镜像：",
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
@@ -273,11 +272,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_is_owner(update): return
-    msg = await update.message.reply_text("🔎 *[1/4] 正在检查代码版本...*", parse_mode="Markdown")
+    msg = await update.message.reply_text("🔎 *⚙️ [1/4] 正在连接 GitHub API 校验远程代码版本...*", parse_mode="Markdown")
 
+    # 1. 增加 -m 10 超时控制，防止死等
     code, api_out = run_cmd(f"curl -s -m 10 {GITHUB_API_URL}")
     if code != 0 or '"sha"' not in api_out:
-        await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 无法连接 GitHub API，更新取消。")
+        await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 无法连接 GitHub API 或网络超时，更新已取消。")
         return
 
     try:
@@ -292,47 +292,46 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if local_sha == remote_sha and local_sha != "":
         await context.bot.edit_message_text(
             chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id,
-            text=f"🟢 *当前已是最新版本！*\n📌 Commit: `{local_sha}`", parse_mode="Markdown"
+            text=f"🟢 *当前已是最新版本，无需升级！*\n📌 本地 Hash: `{local_sha}`\n📌 远程 Hash: `{remote_sha}`", parse_mode="Markdown"
         )
         return
 
     save_tasks_to_disk()
-    await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="🚀 *[2/4] 正在从 GitHub 覆盖源码...*", parse_mode="Markdown")
+    await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text=f"🚀 *⚙️ [2/4] 检测到新版本 ({remote_sha})，正在拉取最新源码...*", parse_mode="Markdown")
 
-    code1, _ = run_cmd(f"curl -fsSL {GITHUB_RAW_URL}/autoupdate_bot.py -o {DATA_DIR}/autoupdate_bot.py")
+    # 2. 增加 -m 15 超时限制，防止在覆盖时卡死
+    code1, _ = run_cmd(f"curl -fsSL -m 15 {GITHUB_RAW_URL}/autoupdate_bot.py -o {DATA_DIR}/autoupdate_bot.py")
     if code1 != 0:
-        await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 下载失败，请检查仓库路径。")
+        await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 源码拉取失败，请检查服务器连接 GitHub RAW 的网络状态。")
         return
 
-    # 写入新版本 SHA Hash
     with open(VERSION_FILE, "w") as f: f.write(remote_sha)
 
-    # 编辑消息通知用户更新完成
     await context.bot.edit_message_text(
-        chat_id=ALLOWED_CHAT_ID, 
-        message_id=msg.message_id, 
-        text=f"✅ *[4/4] 升级成功！*\n📌 当前版本 Commit: `{remote_sha}`\n🔄 服务正在后台平滑重启...", 
+        chat_id=ALLOWED_CHAT_ID,
+        message_id=msg.message_id,
+        text=f"⚙️ *[3/4] 代码覆盖成功！*\n🔄 正在请求 Systemd 重启服务，请稍候...",
         parse_mode="Markdown"
     )
 
     await asyncio.sleep(1)
 
-    # 脱离当前 Cgroup 域非阻塞异步触发 restart，解决死锁挂起问题
+    # 3. 关键修正：异步后台触发 restart，避免阻塞主程序，彻底解决卡死在 [3/4]
     os.system("systemd-run --scope --user=root systemctl restart docker-update-bot.service &")
 
 
 async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
     global is_updating, last_check_time
     if is_updating:
-        if manual: await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 当前已有检测任务在进行中。")
+        if manual: await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 当前已有检测任务在进行中，请勿重复触发。")
         return
 
     if not check_docker_daemon():
-        await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="🚨 Docker 引擎未响应！")
+        await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="🚨 Docker 引擎未响应或已挂起！")
         return
 
     if not monitored_images:
-        if manual: await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 任务池为空。")
+        if manual: await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 监控任务池为空，请先使用 /scan 命令设置需要监控的镜像。")
         return
 
     is_updating = True
@@ -342,7 +341,7 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
     progress_msg = None
 
     if manual:
-        progress_msg = await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=f"🚀 *开始检测 {total_count} 个镜像...*", parse_mode="Markdown")
+        progress_msg = await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=f"🚀 *开始执行镜像拉取与检测任务 ({total_count} 个)...*", parse_mode="Markdown")
 
     results_summary = []
     try:
@@ -360,14 +359,14 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
                     r_code, _ = run_cmd(f"docker restart {c_name}")
                     if r_code != 0: failed = True
 
-                res_str = f"✅ `{img}` -> 已更新并重启" if not failed else f"⚠️ `{img}` -> 已拉取，重启失败"
+                res_str = f"✅ `{img}` -> 已检测到新版本，镜像已更新，相关容器均已重启成功" if not failed else f"⚠️ `{img}` -> 镜像已更新，但部分容器重启失败"
             else:
-                res_str = f"🟢 `{img}` -> 已是最新"
+                res_str = f"🟢 `{img}` -> 暂无更新 (已是最新)"
 
             results_summary.append(res_str)
             await asyncio.sleep(0.5)
 
-        summary_text = f"🏁 *检测完成！*\n\n" + "\n".join(results_summary)
+        summary_text = f"🏁 *巡检任务执行完成！*\n\n" + "\n".join(results_summary)
         if manual and progress_msg:
             await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=progress_msg.message_id, text=summary_text, parse_mode="Markdown")
 
