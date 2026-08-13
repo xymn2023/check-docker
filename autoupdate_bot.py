@@ -40,10 +40,9 @@ ALLOWED_CHAT_ID = ""
 
 
 def load_config():
-    """检测并加载本地 config.json 配置，不存在则报错退出并提示运行初始化脚本"""
+    """检测并加载本地 config.json 配置"""
     global TELEGRAM_BOT_TOKEN, ALLOWED_CHAT_ID
     
-    # 优先使用环境变量（兼容旧配置），否则读取 JSON
     env_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     env_chat = os.getenv("ALLOWED_CHAT_ID", "")
 
@@ -106,8 +105,12 @@ def check_docker_daemon() -> bool:
 
 
 def get_running_docker_images() -> list[str]:
+    """【核心修正】实时获取当前这一刻 Docker 容器使用的最新镜像列表"""
     code, out = run_cmd("docker ps --format '{{.Image}}'")
-    if code != 0 or not out.strip(): return []
+    if code != 0 or not out.strip(): 
+        return []
+    
+    # 过滤空行并去重，保留容器当前的真实镜像名称
     raw_images = [img.strip() for img in out.split("\n") if img.strip()]
     return list(dict.fromkeys(raw_images))
 
@@ -141,25 +144,46 @@ async def auth_check(update: Update) -> bool:
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """【每次实时扫描】/scan 命令处理函数"""
     if not await auth_check(update): return
     chat_id = update.effective_chat.id
 
-    msg = await update.message.reply_text("🔎 正在扫描当前服务器运行中的 Docker 容器...", parse_mode="Markdown")
+    msg = await update.message.reply_text("🔎 正在实时检索当前服务器运行中的 Docker 容器...", parse_mode="Markdown")
 
     if not check_docker_daemon():
-        await context.bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text="❌ *Docker 未启动或无法响应！*", parse_mode="Markdown")
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text="❌ *Docker 引擎未启动或无法响应！*", parse_mode="Markdown")
         return
 
-    images = get_running_docker_images()
-    if not images:
-        await context.bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text="⚠️ 未检测到运行中的 Docker 容器。")
+    # 1. 每次触发 /scan 都重新执行 docker ps 拿最新列表
+    current_running_images = get_running_docker_images()
+
+    if not current_running_images:
+        # 如果镜像被删光了，清空选框状态并提示用户
+        scan_temp_state[chat_id] = {}
+        await context.bot.edit_message_text(
+            chat_id=chat_id, 
+            message_id=msg.message_id, 
+            text="⚠️ 未检测到当前服务器上有任何正在运行的 Docker 容器。"
+        )
         return
 
-    scan_temp_state[chat_id] = {img: (img in monitored_images) for img in images}
+    # 2. 重新构建临时的交互勾选状态：
+    #    仅列出当下【真正存在】的镜像。如果该镜像原本就在监控池 (monitored_images) 中，则默认勾选 ☑️
+    new_scan_state = {}
+    for img in current_running_images:
+        new_scan_state[img] = (img in monitored_images)
+
+    # 覆盖更新该 Chat 的临时状态
+    scan_temp_state[chat_id] = new_scan_state
+
+    # 3. 渲染并输出最新的按钮列表
+    reply_markup = build_scan_keyboard(chat_id)
     await context.bot.edit_message_text(
-        chat_id=chat_id, message_id=msg.message_id,
-        text=f"🔍 *扫描到正在运行 {len(images)} 个镜像*\n请勾选需要自动监控的镜像：",
-        parse_mode="Markdown", reply_markup=build_scan_keyboard(chat_id)
+        chat_id=chat_id, 
+        message_id=msg.message_id,
+        text=f"🔍 *实时扫描到当前运行中 5{len(current_running_images)} 个镜像*\n\n*(已被删除/停止的容器镜像已自动移除)*\n请勾选需要自动检测更新的镜像：",
+        parse_mode="Markdown", 
+        reply_markup=reply_markup
     )
 
 
@@ -174,8 +198,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith("toggle:"):
         img = data.split("toggle:", 1)[1]
-        if img in state: state[img] = not state[img]
-        await query.edit_message_reply_markup(reply_markup=build_scan_keyboard(chat_id))
+        if img in state: 
+            state[img] = not state[img]
+            await query.edit_message_reply_markup(reply_markup=build_scan_keyboard(chat_id))
 
     elif data == "select_all":
         for img in state: state[img] = True
@@ -187,12 +212,15 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data == "save_tasks":
         global monitored_images
+        # 重新给 monitored_images 赋值为【用户本次最新勾选的镜像集合】
         monitored_images = {img for img, checked in state.items() if checked}
+        
+        # 立即覆盖保存到 tasks.json，旧的/被删的镜像在此处被彻底清洗掉
         save_tasks_to_disk()
 
-        selected_text = "\n".join([f"• `{img}`" for img in monitored_images]) if monitored_images else "（无）"
+        selected_text = "\n".join([f"• `{img}`" for img in monitored_images]) if monitored_images else "（当前未勾选任何任务）"
         await query.edit_message_text(
-            f"✅ *任务池已持久化保存到 config 目录！*\n\n📌 监控列表 ({len(monitored_images)} 个):\n{selected_text}",
+            f"✅ *任务池已根据最新扫描结果更新并保存！*\n\n📌 当前生效的监控列表 ({len(monitored_images)} 个):\n{selected_text}\n\n⏱️ 将每隔 `{CHECK_INTERVAL}s` 自动检测上述镜像。",
             parse_mode="Markdown"
         )
 
@@ -206,14 +234,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"📊 *Docker 镜像自动更新服务状态*\n-----------------------------\n"
         f"⚙️ Docker 引擎: *{docker_ok}*\n⏱️ 上次检测: `{last_check_time}`\n📌 状态: *{status_str}*\n\n"
-        f"🎯 *当前监控任务 ({len(monitored_images)} 个):*\n{selected_text}\n\n"
-        f"💡 /scan 配置 | /check 立即检测 | /update 升级程序"
+        f"🎯 *当前保存生效的监控任务 ({len(monitored_images)} 个):*\n{selected_text}\n\n"
+        f"💡 /scan 重新扫描 | /check 立即检测 | /update 升级程序"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/update 程序自我升级（保持 config.json 和 tasks.json 不被破坏）"""
     if not await auth_check(update): return
 
     msg = await update.message.reply_text("🔎 *[1/4] 正在连接 GitHub 检查程序新版本...*", parse_mode="Markdown")
@@ -243,11 +270,10 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.edit_message_text(
         chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id,
-        text=f"🚀 *[2/4] 检测到 GitHub 最新版本 (`{remote_sha}`)！*\n📥 正在覆盖升级代码（已安全保留你的 Token、Chat ID 与任务配置）...",
+        text=f"🚀 *[2/4] 检测到 GitHub 最新版本 (`{remote_sha}`)！*\n📥 正在下载源码（不会修改你的配置文件与任务数据）...",
         parse_mode="Markdown"
     )
 
-    # 仅更新代码文件，不覆盖 json 配置文件
     code1, _ = run_cmd(f"curl -fsSL {GITHUB_RAW_URL}/autoupdate_bot.py -o {DATA_DIR}/autoupdate_bot.py")
     code2, _ = run_cmd(f"curl -fsSL {GITHUB_RAW_URL}/watchdog.py -o {DATA_DIR}/watchdog.py")
 
@@ -270,7 +296,7 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
     global is_updating, last_check_time
     if is_updating:
-        if manual: await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 当前已有任务在进行中。")
+        if manual: await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 当前已有检测任务在进行中。")
         return
 
     if not check_docker_daemon():
@@ -278,7 +304,7 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
         return
 
     if not monitored_images:
-        if manual: await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 任务池为空，请先运行 /scan 勾选监控镜像。")
+        if manual: await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 任务池为空，请先运行 /scan 重新扫描并勾选镜像。")
         return
 
     is_updating = True
@@ -339,7 +365,7 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
             await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=progress_msg.message_id, text=summary_text, parse_mode="Markdown")
 
     except Exception as e:
-        logging.error(f"异常: {e}")
+        logging.error(f"更新异常: {e}")
     finally:
         is_updating = False
 
@@ -352,10 +378,10 @@ async def post_init(application: Application):
     load_tasks_from_disk()
 
     await application.bot.set_my_commands([
-        BotCommand("scan", "扫描本地镜像并配置监控任务"),
-        BotCommand("check", "立即对任务池镜像检测更新"),
+        BotCommand("scan", "实时扫描当前镜像并管理任务"),
+        BotCommand("check", "立即检测已有任务镜像更新"),
         BotCommand("update", "自动升级 Bot 程序自身"),
-        BotCommand("status", "查看任务池与运行状态"),
+        BotCommand("status", "查看当前任务池与运行状态"),
     ])
 
     docker_status = "🟢 正常" if check_docker_daemon() else "🔴 未响应"
@@ -371,7 +397,7 @@ async def post_init(application: Application):
             chat_id=ALLOWED_CHAT_ID,
             text=f"{title}\n------------------------------------\n"
                  f"📌 代码 Commit: `{current_ver}`\n"
-                 f"🎯 恢复继承任务: *{len(monitored_images)} 个*\n"
+                 f"🎯 已加载任务: *{len(monitored_images)} 个*\n"
                  f"⚙️ Docker 引擎: *{docker_status}*",
             parse_mode="Markdown"
         )
