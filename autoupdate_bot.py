@@ -27,7 +27,8 @@ DATA_DIR = "/opt/docker-update-bot"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
 VERSION_FILE = os.path.join(DATA_DIR, ".version")
-UPDATING_MARKER_FILE = os.path.join(DATA_DIR, ".updating_msg")  # 重启真实校验标记
+UPDATING_MARKER_FILE = os.path.join(DATA_DIR, ".updating_msg")
+RESTART_TRIGGER_FILE = os.path.join(DATA_DIR, ".need_restart")  # 外部解耦重启信号
 
 # GitHub 仓库源码路径
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/xymn2023/check-docker/main"
@@ -274,7 +275,7 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_is_owner(update): return
     msg = await update.message.reply_text("🔎 *⚙️ [1/4] 正在连接 GitHub API 校验远程代码版本...*", parse_mode="Markdown")
 
-    # 1. 检查版本
+    # 1. 校验 API
     code, api_out = run_cmd(f"curl -s -m 10 {GITHUB_API_URL}")
     if code != 0 or '"sha"' not in api_out:
         await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 无法连接 GitHub API 或网络超时，更新已取消。")
@@ -305,10 +306,10 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 源码拉取失败，请检查服务器网络状态。")
         return
 
-    # 3. 记录最新 SHA
+    # 3. 写入最新 SHA
     with open(VERSION_FILE, "w") as f: f.write(remote_sha)
 
-    # 4. 写入标记文件
+    # 4. 写入 Telegram 履约标记文件
     try:
         with open(UPDATING_MARKER_FILE, "w", encoding="utf-8") as f:
             json.dump({
@@ -319,26 +320,23 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }, f)
     except Exception as e:
-        logging.error(f"写入标记文件失败: {e}")
+        logging.error(f"写入履约标记文件失败: {e}")
 
-    # 5. 更新 Telegram 提示
+    # 5. 生成重启信号标记文件（通知保活/Watchdog 脚本进行真正安全的外部重启）
+    with open(RESTART_TRIGGER_FILE, "w") as f:
+        f.write("restart")
+
+    # 6. 更新 Telegram 提示
     await context.bot.edit_message_text(
         chat_id=ALLOWED_CHAT_ID,
         message_id=msg.message_id,
-        text=f"⚙️ *[3/4] 代码覆盖成功！*\n🔄 正在请求 Systemd 重启服务，请稍候...",
+        text=f"⚙️ *[3/4] 代码已完成覆盖！*\n🔄 已向系统 Watchdog 发出重启信号，当前进程立即退出...",
         parse_mode="Markdown"
     )
 
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(1)
 
-    # 6. 🚀 关键解耦部分：独立进程组异步发起 restart，主进程主动 exit 彻底消除死锁
-    subprocess.Popen(
-        "sleep 1 && systemctl restart docker-update-bot.service",
-        shell=True,
-        start_new_session=True
-    )
-
-    # 7. 退出当前 Python 主进程，给 Systemd 释放 Stop 空间
+    # 7. 主动正常退出，彻底把掌控权交给外部脚本
     sys.exit(0)
 
 
@@ -414,7 +412,7 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     load_tasks_from_disk()
 
-    # 💡 真实重启校验：新进程拉起时，现场采样并汇报真实系统信息
+    # 重启成功履约检查
     if os.path.exists(UPDATING_MARKER_FILE):
         try:
             with open(UPDATING_MARKER_FILE, "r", encoding="utf-8") as f:
@@ -432,9 +430,9 @@ async def post_init(application: Application):
                 chat_id=chat_id,
                 message_id=message_id,
                 text=(
-                    f"🎉 *[4/4] Systemd 服务真实重启成功！*\n-----------------------------\n"
+                    f"🎉 *[4/4] 外部 Watchdog 重启服务成功！*\n-----------------------------\n"
                     f"📌 Commit Hash: `{sha}`\n"
-                    f"💀 旧进程 PID: `{old_pid}` (已销毁)\n"
+                    f"💀 原进程 PID: `{old_pid}` (已退出)\n"
                     f"🚀 新进程 PID: `{new_pid}` (运行中)\n"
                     f"⚙️ Docker 环境: *{docker_status}*\n"
                     f"⏱️ 启动时间: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`"
@@ -442,7 +440,7 @@ async def post_init(application: Application):
                 parse_mode="Markdown"
             )
         except Exception as e:
-            logging.error(f"发送重启成功真实反馈失败: {e}")
+            logging.error(f"发送重启成功反馈失败: {e}")
         finally:
             if os.path.exists(UPDATING_MARKER_FILE):
                 os.remove(UPDATING_MARKER_FILE)
