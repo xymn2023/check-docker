@@ -13,18 +13,17 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# 配置日志格式
+# 日志输出控制
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
-# ==================== 配置区域 ====================
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # 替换为你的 Token
-ALLOWED_CHAT_ID = "YOUR_CHAT_ID_HERE"        # 替换为你的 Chat ID
+# 读取环境变量配置
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
 
-CHECK_INTERVAL = 3600  # 自动巡检间隔（秒）
-# ==================================================
+CHECK_INTERVAL = 3600  # 自动巡检间隔时间 (秒)
 
 monitored_images = set()
 scan_temp_state = {}
@@ -33,7 +32,7 @@ last_check_time = "尚未执行"
 
 
 def run_cmd(cmd: str) -> tuple[int, str]:
-    """带有超时保护的命令执行"""
+    """带超时限制的 Shell 命令执行"""
     try:
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
         return result.returncode, result.stdout.strip() + "\n" + result.stderr.strip()
@@ -44,13 +43,13 @@ def run_cmd(cmd: str) -> tuple[int, str]:
 
 
 def check_docker_daemon() -> bool:
-    """自检 1：检测 Docker Daemon 是否正常响应"""
+    """自检：检测 Docker Daemon 状态"""
     code, _ = run_cmd("docker info")
     return code == 0
 
 
 def get_running_docker_images() -> list[str]:
-    """读取当前服务器运行的镜像"""
+    """获取当前运行中容器的镜像"""
     code, out = run_cmd("docker ps --format '{{.Image}}'")
     if code != 0 or not out.strip():
         return []
@@ -59,6 +58,7 @@ def get_running_docker_images() -> list[str]:
 
 
 def get_image_digest(image_name: str) -> str:
+    """获取本地镜像的 RepoDigest 校验码"""
     code, out = run_cmd(f"docker inspect --format='{{{{index .RepoDigests 0}}}}' {image_name}")
     if code == 0 and out:
         return out.split("\n")[0]
@@ -66,6 +66,7 @@ def get_image_digest(image_name: str) -> str:
 
 
 def build_scan_keyboard(chat_id: str) -> InlineKeyboardMarkup:
+    """构建联排按键选框"""
     state = scan_temp_state.get(chat_id, {})
     keyboard = []
     for img, checked in state.items():
@@ -81,6 +82,7 @@ def build_scan_keyboard(chat_id: str) -> InlineKeyboardMarkup:
 
 
 async def auth_check(update: Update) -> bool:
+    """身份验证控制"""
     if str(update.effective_chat.id) != str(ALLOWED_CHAT_ID):
         if update.message:
             await update.message.reply_text("⛔ 无权使用此 Bot。")
@@ -88,9 +90,8 @@ async def auth_check(update: Update) -> bool:
     return True
 
 
-# ==================== 指令交互逻辑 ====================
-
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scan 手动扫描逻辑"""
     if not await auth_check(update): return
     chat_id = update.effective_chat.id
 
@@ -113,6 +114,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理联排按键的点击交互"""
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
@@ -146,8 +148,9 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/status 服务运行状态汇报"""
     if not await auth_check(update): return
-    
+
     docker_ok = "🟢 正常响应" if check_docker_daemon() else "🔴 异常或未启动"
     selected_text = "\n".join([f"• `{img}`" for img in monitored_images]) if monitored_images else "（当前未配置任何监控镜像）"
     status_str = "🔄 正在更新中..." if is_updating else "💤 待命巡检中"
@@ -166,13 +169,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
+    """处理检测拉取更新的主核逻辑"""
     global is_updating, last_check_time
     if is_updating:
         if manual:
             await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 当前已有更新任务在进行中，请稍后再试。")
         return
 
-    # 自检 Docker 环境
     if not check_docker_daemon():
         await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="🚨 *警告*：检测到 Docker 守护进程宕机或未响应，更新任务暂停执行！", parse_mode="Markdown")
         return
@@ -211,7 +214,7 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
 
                 code, container_names = run_cmd(f"docker ps -q --filter ancestor={img} | xargs -r docker inspect --format '{{{{.Name}}}}'")
                 clean_names = [name.lstrip("/") for name in container_names.split("\n") if name.strip()]
-                
+
                 restart_failed = False
                 for c_name in clean_names:
                     r_code, _ = run_cmd(f"docker restart {c_name}")
@@ -243,7 +246,7 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(application: Application):
-    """启动自检与成功通知"""
+    """启动通知与菜单绑定"""
     commands = [
         BotCommand("scan", "扫描本地镜像并管理更新任务池"),
         BotCommand("check", "立即对任务池中的镜像检测更新"),
@@ -251,27 +254,27 @@ async def post_init(application: Application):
     ]
     await application.bot.set_my_commands(commands)
 
-    # 启动时检测 Docker
     docker_status = "🟢 正常" if check_docker_daemon() else "🔴 未响应"
-    
-    # 判断是否是崩溃重启（通过环境变量传递标识）
     is_reboot = os.getenv("IS_RESTART_EVENT", "false") == "true"
-    
     title = "🔄 *Docker 监控 Bot 崩溃重启成功通知*" if is_reboot else "🚀 *Docker 监控 Bot 启动成功通知*"
-    
-    await application.bot.send_message(
-        chat_id=ALLOWED_CHAT_ID,
-        text=f"{title}\n"
-             f"------------------------------------\n"
-             f"⏱️ 启动时间: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
-             f"⚙️ Docker 守护进程: *{docker_status}*\n"
-             f"💡 发送 /scan 即可配置镜像监控任务。",
-        parse_mode="Markdown"
-    )
+
+    if ALLOWED_CHAT_ID:
+        await application.bot.send_message(
+            chat_id=ALLOWED_CHAT_ID,
+            text=f"{title}\n"
+                 f"------------------------------------\n"
+                 f"⏱️ 启动时间: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
+                 f"⚙️ Docker 守护进程: *{docker_status}*\n"
+                 f"💡 发送 /scan 即可配置镜像监控任务。",
+            parse_mode="Markdown"
+        )
 
 
 def main():
-    # 增加网络重试，防止网络瞬断导致程序启动异常
+    if not TELEGRAM_BOT_TOKEN:
+        print("[ERROR] 未获取到 TELEGRAM_BOT_TOKEN，进程退出。")
+        sys.exit(1)
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("scan", cmd_scan))

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# 项目: Docker 镜像自动更新 Telegram Bot 一键部署脚本 (venv 版)
+# 项目: Docker 镜像自动更新 Telegram Bot 一键部署脚本
+# 仓库: https://github.com/xymn2023/check-docker
 # =========================================================
 
 set -e
@@ -48,30 +49,23 @@ check_and_install_env() {
         INFO "Docker 安装完成！"
     fi
 
-    # 检查 Python3 及 python3-venv 支持包
-    if command -v python3 &> /dev/null; then
-        INFO "检测到 Python3 已存在。"
+    # 检查 Python3 并强制安装 python3-venv 和 python3-pip
+    INFO "正在检查 Python3 及虚拟环境组件..."
+    if command -v apt-get &> /dev/null; then
+        apt-get update -q
+        apt-get install -y python3 python3-pip python3-venv curl -q
+    elif command -v yum &> /dev/null; then
+        yum install -y python3 python3-pip curl -q
     else
-        WARN "未检测到 Python3，正在自动安装..."
-        if command -v apt-get &> /dev/null; then
-            apt-get update && apt-get install -y python3 python3-pip python3-venv curl
-        elif command -v yum &> /dev/null; then
-            yum install -y python3 python3-pip curl
-        else
+        if ! command -v python3 &> /dev/null; then
             ERROR "未找到支持的包管理器 (apt/yum)，请手动安装 python3。"
             exit 1
         fi
-        INFO "Python3 安装完成！"
-    fi
-
-    # 确保 python3-venv 组件已安装 (Debian/Ubuntu 系统特别需要)
-    if command -v apt-get &> /dev/null; then
-        apt-get install -y python3-venv python3-pip -q
     fi
 
     mkdir -p "${INSTALL_DIR}"
 
-    # 创建并初始化虚拟环境
+    # 创建隔离的虚拟环境 (核心修复: 解决 PEP 668 报错)
     if [[ ! -d "${VENV_DIR}" ]]; then
         INFO "正在创建 Python 虚拟环境 (venv)..."
         python3 -m venv "${VENV_DIR}"
@@ -80,14 +74,14 @@ check_and_install_env() {
         INFO "检测到已存在 Python 虚拟环境，跳过创建。"
     fi
 
-    # 在虚拟环境中安装升级 pip 和依赖
+    # 在虚拟环境内安装扩展依赖
     INFO "正在虚拟环境中安装 Python 依赖库..."
     "${VENV_DIR}/bin/python" -m pip install --upgrade pip -q
     "${VENV_DIR}/bin/python" -m pip install python-telegram-bot requests pyyaml -q
     INFO "虚拟环境依赖库安装完成！"
 }
 
-# 3. 交互式获取用户配置
+# 3. 交互式获取并验证用户配置 (死循环等待直至输入)
 get_user_input() {
     echo -e "\n--------------------------------------------------"
     INFO "请输入您的 Telegram 配置参数："
@@ -121,21 +115,21 @@ get_user_input() {
         fi
     done
 
-    # 写入环境变量文件
+    # 写入环境变量保存文件
     cat <<EOF > "${ENV_FILE}"
 TELEGRAM_BOT_TOKEN="${BOT_TOKEN}"
 ALLOWED_CHAT_ID="${CHAT_ID}"
 EOF
     chmod 600 "${ENV_FILE}"
-    INFO "配置参数已保存！"
+    INFO "配置参数已成功保存！"
 }
 
 # 4. 下载程序源码
 download_files() {
-    INFO "正在从 GitHub 下载程序文件..."
+    INFO "正在下载主程序与守护自检程序..."
 
     if [[ -f "./${MAIN_SCRIPT}" && -f "./${WATCHDOG_SCRIPT}" ]]; then
-        INFO "检测到本地源码，使用本地文件部署..."
+        INFO "检测到当前目录存在本地源码，使用本地文件部署..."
         cp "./${MAIN_SCRIPT}" "${INSTALL_DIR}/"
         cp "./${WATCHDOG_SCRIPT}" "${INSTALL_DIR}/"
     else
@@ -145,18 +139,17 @@ download_files() {
     fi
 
     if [[ ! -f "${INSTALL_DIR}/${MAIN_SCRIPT}" || ! -f "${INSTALL_DIR}/${WATCHDOG_SCRIPT}" ]]; then
-        ERROR "核心脚本下载失败！请检查 GitHub 仓库与文件路径。"
+        ERROR "核心脚本下载失败！请检查 GitHub 仓库文件状态。"
         exit 1
     fi
 
     INFO "程序代码部署完成！"
 }
 
-# 5. 配置 Systemd 后台服务 (使用虚拟环境解释器)
+# 5. 配置 Systemd 后台服务 (指定 venv 解释器)
 start_services() {
     INFO "正在配置 Systemd 后台守护服务..."
 
-    # 注意：ExecStart 使用虚拟环境下的 bin/python 解释器执行
     cat <<EOF > /etc/systemd/system/docker-update-bot.service
 [Unit]
 Description=Docker Auto Update Telegram Bot Watchdog Service (Venv)
@@ -179,10 +172,10 @@ EOF
     systemctl enable docker-update-bot.service
     systemctl restart docker-update-bot.service
 
-    INFO "服务启动成功！已通过 Python 虚拟环境托管至 Systemd 后台运行。"
+    INFO "服务启动成功！已托管至 Systemd 后台运行。"
 }
 
-# 6. 完全卸载功能 (包含清理虚拟环境)
+# 6. 完全卸载功能
 uninstall() {
     WARN "您确定要完全卸载 Docker 镜像更新 Bot 吗？"
     read -r -p "⚠️ 输入 'y' 或 'Y' 确认卸载，其他任意键取消: " confirm
@@ -205,13 +198,12 @@ uninstall() {
     rm -f /etc/systemd/system/docker-update-bot.service
     systemctl daemon-reload
 
-    # 直接删除整个安装目录（包含虚拟环境 venv 与依赖包）
     if [[ -d "${INSTALL_DIR}" ]]; then
         rm -rf "${INSTALL_DIR}"
-        INFO "已清理安装目录、虚拟环境及配置文件: ${INSTALL_DIR}"
+        INFO "已删除安装目录及虚拟环境: ${INSTALL_DIR}"
     fi
 
-    INFO "✅ 彻底卸载完成！系统全局环境未受影响。"
+    INFO "✅ 彻底卸载完成！"
     exit 0
 }
 
@@ -221,7 +213,7 @@ show_logs() {
     journalctl -u docker-update-bot.service -f -n 50
 }
 
-# 8. 主菜单
+# 8. 主菜单交互入口
 main_menu() {
     clear
     echo -e "${GREEN}"
@@ -233,7 +225,7 @@ main_menu() {
     echo " 2. 查看后台运行日志"
     echo " 3. 重启程序服务"
     echo " 4. 停止程序服务"
-    echo " 5. 卸载程序及虚拟环境"
+    echo " 5. 卸载程序及关联环境"
     echo " 0. 退出脚本"
     echo ""
     read -r -p "请输入数字选择操作 [0-5]: " num
@@ -245,7 +237,7 @@ main_menu() {
             get_user_input
             download_files
             start_services
-            INFO "🎉 部署全部完成！程序正在 Python 虚拟环境中运行，可安全退出终端。"
+            INFO "🎉 部署安装全部完成！程序正在 Python 虚拟环境中运行，可安全关闭终端。"
             ;;
         2)
             show_logs
