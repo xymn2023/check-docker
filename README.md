@@ -7,4 +7,4 @@
 在你的 Linux 服务器上运行以下命令即可完成部署：
 
 ```bash
-bash <(curl -fsSL [https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/deploy.sh](https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME/main/deploy.sh))
+bash <(curl -fsSL https://raw.githubusercontent.com/xymn2023/check-docker/main/deploy.sh
