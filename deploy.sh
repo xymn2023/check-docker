@@ -1,45 +1,47 @@
 #!/usr/bin/env bash
 set -e
 
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+PLAIN='\033[0m'
+
 INSTALL_DIR="/opt/docker-update-bot"
 CONFIG_FILE="${INSTALL_DIR}/config.json"
+SERVICE_FILE="/etc/systemd/system/docker-update-bot.service"
 REPO_RAW_URL="https://raw.githubusercontent.com/xymn2023/check-docker/main"
 
-echo "========================================="
-echo "   Docker 镜像自动更新 Bot 安装程序"
-echo "========================================="
-
-mkdir -p ${INSTALL_DIR}
-
-# 1. 检查配置 JSON 文件是否存在
-if [ -f "${CONFIG_FILE}" ]; then
-    echo "🟢 检测到已存在的 config.json 配置文件！跳过手动输入阶段..."
-else
-    echo "⚠️ 未找到配置文件，请输入 Telegram Bot 配置信息："
-    read -p "👉 请输入 TELEGRAM_BOT_TOKEN: " input_token
-    read -p "👉 请输入 ALLOWED_CHAT_ID: " input_chat_id
-
-    if [ -z "$input_token" ] || [ -z "$input_chat_id" ]; then
-        echo "❌ Token 或 Chat ID 不能为空，安装中断。"
-        exit 1
-    fi
-
-    cat <<EOF > ${CONFIG_FILE}
-{
-  "bot_token": "${input_token}",
-  "chat_id": "${input_chat_id}"
-}
-EOF
-    echo "✅ 配置文件已创建保存至: ${CONFIG_FILE}"
+# 检查根权限
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}错误：必须使用 root 权限运行此脚本！${PLAIN}"
+   exit 1
 fi
 
-# 2. 拉取最新代码
-echo "📥 正在拉取程序文件..."
-curl -fsSL ${REPO_RAW_URL}/autoupdate_bot.py -o ${INSTALL_DIR}/autoupdate_bot.py
-curl -fsSL ${REPO_RAW_URL}/watchdog.py -o ${INSTALL_DIR}/watchdog.py
+# 检查服务状态
+get_status() {
+    if systemctl is-active --quiet docker-update-bot.service 2>/dev/null; then
+        echo -e "${GREEN}正在运行${PLAIN}"
+    elif systemctl is-enabled --quiet docker-update-bot.service 2>/dev/null; then
+        echo -e "${YELLOW}已停止${PLAIN}"
+    else
+        echo -e "${RED}未安装${PLAIN}"
+    fi
+}
 
-# 3. 部署 Systemd 服务
-cat <<EOF > /etc/systemd/system/docker-update-bot.service
+# 核心安装/更新源码函数
+do_fetch_code() {
+    echo -e "${BLUE}📥 正在从 GitHub 拉取最新程序文件...${PLAIN}"
+    curl -fsSL ${REPO_RAW_URL}/autoupdate_bot.py -o ${INSTALL_DIR}/autoupdate_bot.py
+    curl -fsSL ${REPO_RAW_URL}/watchdog.py -o ${INSTALL_DIR}/watchdog.py
+    curl -fsSL ${REPO_RAW_URL}/uninstall.sh -o ${INSTALL_DIR}/uninstall.sh
+    chmod +x ${INSTALL_DIR}/uninstall.sh
+}
+
+# 部署 Systemd 服务单元
+do_deploy_service() {
+    cat <<EOF > ${SERVICE_FILE}
 [Unit]
 Description=Docker Auto Update Telegram Bot
 After=network.target docker.service
@@ -57,10 +59,136 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable docker-update-bot.service
-systemctl restart docker-update-bot.service
+    systemctl daemon-reload
+    systemctl enable docker-update-bot.service
+    systemctl restart docker-update-bot.service
+}
 
-echo "========================================="
-echo "🎉 安装/更新完成！服务已在后台启动。"
-echo "========================================="
+# 首次安装流程
+install_bot() {
+    echo -e "\n${GREEN}========================================="
+    echo "    开始初始化安装 Docker 监控 Bot"
+    echo -e "=========================================${PLAIN}\n"
+
+    mkdir -p ${INSTALL_DIR}
+
+    # 提示输入 Token 和 Chat ID
+    read -p "👉 请输入 TELEGRAM_BOT_TOKEN: " input_token
+    read -p "👉 请输入 ALLOWED_CHAT_ID: " input_chat_id
+
+    if [ -z "$input_token" ] || [ -z "$input_chat_id" ]; then
+        echo -e "${RED}❌ Token 或 Chat ID 不能为空，安装取消。${PLAIN}"
+        exit 1
+    fi
+
+    cat <<EOF > ${CONFIG_FILE}
+{
+  "bot_token": "${input_token}",
+  "chat_id": "${input_chat_id}"
+}
+EOF
+    echo -e "${GREEN}✅ 配置已写入: ${CONFIG_FILE}${PLAIN}"
+
+    do_fetch_code
+    do_deploy_service
+
+    echo -e "\n${GREEN}🎉 安装完成！服务已在后台成功启动。${PLAIN}"
+}
+
+# 覆盖升级源码（保留配置与任务）
+update_code() {
+    echo -e "\n${BLUE}正在更新 Bot 程序源码...${PLAIN}"
+    do_fetch_code
+    systemctl restart docker-update-bot.service
+    echo -e "${GREEN}✅ 程序更新成功，服务已重启！${PLAIN}"
+}
+
+# 修改配置
+reconfig() {
+    echo -e "\n${YELLOW}修改 Telegram Bot 配置${PLAIN}"
+    read -p "👉 请输入全新的 TELEGRAM_BOT_TOKEN: " input_token
+    read -p "👉 请输入全新的 ALLOWED_CHAT_ID: " input_chat_id
+
+    if [ -z "$input_token" ] || [ -z "$input_chat_id" ]; then
+        echo -e "${RED}❌ 输入不能为空，取消修改。${PLAIN}"
+        return
+    fi
+
+    cat <<EOF > ${CONFIG_FILE}
+{
+  "bot_token": "${input_token}",
+  "chat_id": "${input_chat_id}"
+}
+EOF
+    systemctl restart docker-update-bot.service
+    echo -e "${GREEN}✅ 配置修改成功，服务已重启生效！${PLAIN}"
+}
+
+# 查看日志
+show_logs() {
+    echo -e "${BLUE}正在调取服务运行日志 (按 Ctrl+C 退出查看)...${PLAIN}\n"
+    journalctl -u docker-update-bot.service -n 50 -f
+}
+
+# 执行彻底卸载
+uninstall_bot() {
+    echo -e "\n${RED}⚠️ 警告：卸载将完全擦除所有程序文件、Token 配置以及保存的镜像任务！${PLAIN}"
+    read -p "确定要彻底卸载吗？(y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        systemctl stop docker-update-bot.service || true
+        systemctl disable docker-update-bot.service || true
+        rm -f ${SERVICE_FILE}
+        systemctl daemon-reload
+        rm -rf ${INSTALL_DIR}
+        echo -e "${GREEN}✅ 服务与配置文件已彻底清理卸载。${PLAIN}"
+        exit 0
+    else
+        echo "已取消卸载。"
+    fi
+}
+
+# 主交互菜单
+show_menu() {
+    clear
+    echo -e "${GREEN}========================================="
+    echo "    Docker 镜像自动更新 Bot 管理面板"
+    echo -e "=========================================${PLAIN}"
+    echo -e "服务状态: $(get_status)"
+    echo -e "安装路径: ${INSTALL_DIR}"
+    echo "-----------------------------------------"
+    echo " 1. 查看运行状态 / 日志"
+    echo " 2. 更新 Bot 程序代码"
+    echo " 3. 修改 Token / Chat ID 配置"
+    echo " 4. 重启 Bot 服务"
+    echo " 5. 停止 Bot 服务"
+    echo " 6. 彻底卸载程序 (清除所有文件)"
+    echo " 0. 退出菜单"
+    echo "-----------------------------------------"
+    read -p "请输入数字选择 [0-6]: " choice
+
+    case "$choice" in
+        1) show_logs ;;
+        2) update_code ;;
+        3) reconfig ;;
+        4) 
+            systemctl restart docker-update-bot.service
+            echo -e "${GREEN}✅ 服务重启成功！${PLAIN}"
+            ;;
+        5) 
+            systemctl stop docker-update-bot.service
+            echo -e "${YELLOW}⏸️ 服务已停止。${PLAIN}"
+            ;;
+        6) uninstall_bot ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入错误，请输入有效数字！${PLAIN}" ;;
+    esac
+}
+
+# ================= 脚本主入口判断 =================
+if [ ! -f "${CONFIG_FILE}" ] || [ ! -f "${SERVICE_FILE}" ]; then
+    # 未检测到安装文件 -> 走首次安装流程
+    install_bot
+else
+    # 已检测到安装 -> 直接弹菜单面板
+    show_menu
+fi
