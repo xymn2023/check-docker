@@ -274,7 +274,7 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_is_owner(update): return
     msg = await update.message.reply_text("🔎 *⚙️ [1/4] 正在连接 GitHub API 校验远程代码版本...*", parse_mode="Markdown")
 
-    # 1. 检查 API 版本 (10 秒超时)[cite: 1, 2]
+    # 1. 检查版本
     code, api_out = run_cmd(f"curl -s -m 10 {GITHUB_API_URL}")
     if code != 0 or '"sha"' not in api_out:
         await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 无法连接 GitHub API 或网络超时，更新已取消。")
@@ -299,7 +299,7 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_tasks_to_disk()
     await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text=f"🚀 *⚙️ [2/4] 检测到新版本 ({remote_sha})，正在拉取最新源码...*", parse_mode="Markdown")
 
-    # 2. 覆盖源码 (15 秒超时)[cite: 1, 2]
+    # 2. 覆盖源码
     code1, _ = run_cmd(f"curl -fsSL -m 15 {GITHUB_RAW_URL}/autoupdate_bot.py -o {DATA_DIR}/autoupdate_bot.py")
     if code1 != 0:
         await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 源码拉取失败，请检查服务器网络状态。")
@@ -308,7 +308,7 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 3. 记录最新 SHA
     with open(VERSION_FILE, "w") as f: f.write(remote_sha)
 
-    # 4. 写入强校验标记文件[cite: 1, 2]
+    # 4. 写入标记文件
     try:
         with open(UPDATING_MARKER_FILE, "w", encoding="utf-8") as f:
             json.dump({
@@ -321,18 +321,25 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"写入标记文件失败: {e}")
 
-    # 5. 修改消息提示正准备交给 Systemd 真实的物理拉起[cite: 1, 2]
+    # 5. 更新 Telegram 提示
     await context.bot.edit_message_text(
         chat_id=ALLOWED_CHAT_ID,
         message_id=msg.message_id,
-        text=f"⚙️ *[3/4] 代码已覆盖！*\n🔄 正在请求 Systemd 物理重启服务，请等待新进程就绪...",
+        text=f"⚙️ *[3/4] 代码覆盖成功！*\n🔄 正在请求 Systemd 重启服务，请稍候...",
         parse_mode="Markdown"
     )
 
-    await asyncio.sleep(1)
+    await asyncio.sleep(0.5)
 
-    # 6. 使用 nohup 异步在独立的 Shell 环境中真实重启 Systemd，规避死锁[cite: 1, 2]
-    os.system("nohup systemctl restart docker-update-bot.service >/dev/null 2>&1 &")
+    # 6. 🚀 关键解耦部分：独立进程组异步发起 restart，主进程主动 exit 彻底消除死锁
+    subprocess.Popen(
+        "sleep 1 && systemctl restart docker-update-bot.service",
+        shell=True,
+        start_new_session=True
+    )
+
+    # 7. 退出当前 Python 主进程，给 Systemd 释放 Stop 空间
+    sys.exit(0)
 
 
 async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
@@ -407,7 +414,7 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     load_tasks_from_disk()
 
-    # 💡 真实重启校验逻辑：新进程启动后现场采样并汇报真实系统信息[cite: 1, 2]
+    # 💡 真实重启校验：新进程拉起时，现场采样并汇报真实系统信息
     if os.path.exists(UPDATING_MARKER_FILE):
         try:
             with open(UPDATING_MARKER_FILE, "r", encoding="utf-8") as f:
@@ -419,10 +426,8 @@ async def post_init(application: Application):
             old_pid = data.get("old_pid", "unknown")
             new_pid = os.getpid()
 
-            # 真实测量环境状态
             docker_status = "🟢 正常" if check_docker_daemon() else "🔴 异常"
 
-            # 真实反馈：输出新老 PID 变化证明原进程已被真实杀死，新进程装载成功！[cite: 1, 2]
             await application.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
