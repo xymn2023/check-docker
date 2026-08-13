@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import re
 import subprocess
 import asyncio
 import logging
@@ -20,7 +21,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# 文件路径定义
+# 文件与目录配置
 DATA_DIR = "/opt/docker-update-bot"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
@@ -39,10 +40,10 @@ TELEGRAM_BOT_TOKEN = ""
 ALLOWED_CHAT_ID = ""
 
 
-def load_config():
-    """检测并加载本地 config.json 配置"""
+def load_config() -> bool:
+    """读取本地 config.json 配置，不存在或无效时返回 False"""
     global TELEGRAM_BOT_TOKEN, ALLOWED_CHAT_ID
-    
+
     env_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     env_chat = os.getenv("ALLOWED_CHAT_ID", "")
 
@@ -63,12 +64,12 @@ def load_config():
         except Exception as e:
             logging.error(f"读取 config.json 失败: {e}")
 
-    print("\n❌ 错误：未检测到有效配置！请运行一键脚本进行配置初始化。\n")
+    print("\n❌ 错误：未检测到有效配置！请运行 deploy.sh 部署管理脚本进行初始化。\n")
     return False
 
 
 def load_tasks_from_disk():
-    """读取历史任务池 JSON"""
+    """读取已保存的镜像任务池"""
     global monitored_images
     if os.path.exists(TASKS_FILE):
         try:
@@ -104,15 +105,56 @@ def check_docker_daemon() -> bool:
     return code == 0
 
 
+def is_valid_docker_image_name(image_name: str) -> bool:
+    """
+    【核心优化】校验 Docker 镜像名称是否属于合规的、可从云端仓库 Pull 的正规镜像名
+    """
+    if not image_name or not isinstance(image_name, str):
+        return False
+
+    image_name = image_name.strip()
+
+    # 1. 过滤悬空镜像/无名镜像
+    if "<none>" in image_name:
+        return False
+
+    # 2. 过滤纯 16 进制 Hash ID（如 1487abffa4fa 或 64位长ID）
+    if re.fullmatch(r"[0-9a-fA-F]+", image_name):
+        return False
+
+    # 3. 匹配 Docker 官方标准镜像名称正则 (支持 域名/用户名/仓库名:标签)
+    # 允许格式:
+    # - mysql:5.7.22
+    # - louislam/uptime-kuma:latest
+    # - ghcr.io/snailyp/gemini-balance:latest
+    # - nginx
+    pattern = r"^(?:[a-zA-Z0-9.-]+(?::[0-9]+)?/)?(?:[a-zA-Z0-9_.-]+/)?[a-zA-Z0-9_.-]+(?::[a-zA-Z0-9_.-]+)?$"
+    if not re.match(pattern, image_name):
+        return False
+
+    return True
+
+
 def get_running_docker_images() -> list[str]:
-    """【核心修正】实时获取当前这一刻 Docker 容器使用的最新镜像列表"""
+    """
+    【核心优化】实时获取当前服务器运行中容器的标准镜像列表
+    排除匿名的 Image ID，自动补齐缺失的 :latest 标签
+    """
     code, out = run_cmd("docker ps --format '{{.Image}}'")
-    if code != 0 or not out.strip(): 
+    if code != 0 or not out.strip():
         return []
-    
-    # 过滤空行并去重，保留容器当前的真实镜像名称
-    raw_images = [img.strip() for img in out.split("\n") if img.strip()]
-    return list(dict.fromkeys(raw_images))
+
+    valid_images = []
+    for line in out.split("\n"):
+        img = line.strip()
+        if is_valid_docker_image_name(img):
+            # 如果没有显示指定 Tag（例如直接运行 nginx），自动补齐 :latest 方便比对
+            if ":" not in img.split("/")[-1]:
+                img = f"{img}:latest"
+            valid_images.append(img)
+
+    # 去重并保持原始顺序
+    return list(dict.fromkeys(valid_images))
 
 
 def get_image_digest(image_name: str) -> str:
@@ -144,45 +186,40 @@ async def auth_check(update: Update) -> bool:
 
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """【每次实时扫描】/scan 命令处理函数"""
+    """/scan 实时扫描当前容器的正规镜像"""
     if not await auth_check(update): return
     chat_id = update.effective_chat.id
 
-    msg = await update.message.reply_text("🔎 正在实时检索当前服务器运行中的 Docker 容器...", parse_mode="Markdown")
+    msg = await update.message.reply_text("🔎 正在实时检索服务器运行中的 Docker 容器镜像...", parse_mode="Markdown")
 
     if not check_docker_daemon():
         await context.bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id, text="❌ *Docker 引擎未启动或无法响应！*", parse_mode="Markdown")
         return
 
-    # 1. 每次触发 /scan 都重新执行 docker ps 拿最新列表
     current_running_images = get_running_docker_images()
 
     if not current_running_images:
-        # 如果镜像被删光了，清空选框状态并提示用户
         scan_temp_state[chat_id] = {}
         await context.bot.edit_message_text(
-            chat_id=chat_id, 
-            message_id=msg.message_id, 
-            text="⚠️ 未检测到当前服务器上有任何正在运行的 Docker 容器。"
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text="⚠️ 未检测到当前服务器上有任何合规的可检测 Docker 镜像。"
         )
         return
 
-    # 2. 重新构建临时的交互勾选状态：
-    #    仅列出当下【真正存在】的镜像。如果该镜像原本就在监控池 (monitored_images) 中，则默认勾选 ☑️
+    # 构建勾选状态：如果该标准镜像已在 monitored_images 监控池中，默认勾选 ☑️
     new_scan_state = {}
     for img in current_running_images:
         new_scan_state[img] = (img in monitored_images)
 
-    # 覆盖更新该 Chat 的临时状态
     scan_temp_state[chat_id] = new_scan_state
 
-    # 3. 渲染并输出最新的按钮列表
     reply_markup = build_scan_keyboard(chat_id)
     await context.bot.edit_message_text(
-        chat_id=chat_id, 
+        chat_id=chat_id,
         message_id=msg.message_id,
-        text=f"🔍 *实时扫描到当前运行中 5{len(current_running_images)} 个镜像*\n\n*(已被删除/停止的容器镜像已自动移除)*\n请勾选需要自动检测更新的镜像：",
-        parse_mode="Markdown", 
+        text=f"🔍 *实时扫描到当前运行中 {len(current_running_images)} 个标准镜像*\n\n*(已自动剔除隐式 ID 与悬空镜像)*\n请勾选需要自动检测更新的镜像：",
+        parse_mode="Markdown",
         reply_markup=reply_markup
     )
 
@@ -198,7 +235,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith("toggle:"):
         img = data.split("toggle:", 1)[1]
-        if img in state: 
+        if img in state:
             state[img] = not state[img]
             await query.edit_message_reply_markup(reply_markup=build_scan_keyboard(chat_id))
 
@@ -212,15 +249,12 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data == "save_tasks":
         global monitored_images
-        # 重新给 monitored_images 赋值为【用户本次最新勾选的镜像集合】
         monitored_images = {img for img, checked in state.items() if checked}
-        
-        # 立即覆盖保存到 tasks.json，旧的/被删的镜像在此处被彻底清洗掉
         save_tasks_to_disk()
 
-        selected_text = "\n".join([f"• `{img}`" for img in monitored_images]) if monitored_images else "（当前未勾选任何任务）"
+        selected_text = "\n".join([f"• `{img}`" for img in monitored_images]) if monitored_images else "（当前未选择任何任务）"
         await query.edit_message_text(
-            f"✅ *任务池已根据最新扫描结果更新并保存！*\n\n📌 当前生效的监控列表 ({len(monitored_images)} 个):\n{selected_text}\n\n⏱️ 将每隔 `{CHECK_INTERVAL}s` 自动检测上述镜像。",
+            f"✅ *监控任务池已成功同步保存！*\n\n📌 当前已激活监控 ({len(monitored_images)} 个):\n{selected_text}\n\n⏱️ 系统将每隔 `{CHECK_INTERVAL}s` 自动巡检上述镜像。",
             parse_mode="Markdown"
         )
 
@@ -241,9 +275,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/update 脚本自我升级逻辑"""
     if not await auth_check(update): return
 
-    msg = await update.message.reply_text("🔎 *[1/4] 正在连接 GitHub 检查程序新版本...*", parse_mode="Markdown")
+    msg = await update.message.reply_text("🔎 *[1/4] 正在检查 GitHub 上的最新发布代码...*", parse_mode="Markdown")
 
     code, api_out = run_cmd(f"curl -s -m 10 {GITHUB_API_URL}")
     if code != 0 or '"sha"' not in api_out:
@@ -270,7 +305,7 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.edit_message_text(
         chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id,
-        text=f"🚀 *[2/4] 检测到 GitHub 最新版本 (`{remote_sha}`)！*\n📥 正在下载源码（不会修改你的配置文件与任务数据）...",
+        text=f"🚀 *[2/4] 发现 GitHub 最新版本 (`{remote_sha}`)！*\n📥 正在平滑覆盖更新源码（配置与任务列表安全保留）...",
         parse_mode="Markdown"
     )
 
@@ -278,14 +313,14 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code2, _ = run_cmd(f"curl -fsSL {GITHUB_RAW_URL}/watchdog.py -o {DATA_DIR}/watchdog.py")
 
     if code1 != 0 or code2 != 0:
-        await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 源码下载失败，升级中断。")
+        await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 源码拉取失败，更新中断。")
         return
 
     with open(VERSION_FILE, "w") as f: f.write(remote_sha)
 
     await context.bot.edit_message_text(
         chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id,
-        text="⚙️ *[3/4] 最新源码覆盖成功！*\n🔄 正在请求 Systemd 重启服务，请等待 5 秒...", parse_mode="Markdown"
+        text="⚙️ *[3/4] 代码覆盖成功！*\n🔄 正在请求 Systemd 重启服务，请等待 5 秒...", parse_mode="Markdown"
     )
 
     os.environ["IS_SELF_UPGRADE"] = "true"
@@ -378,7 +413,7 @@ async def post_init(application: Application):
     load_tasks_from_disk()
 
     await application.bot.set_my_commands([
-        BotCommand("scan", "实时扫描当前镜像并管理任务"),
+        BotCommand("scan", "实时扫描当前容器镜像并管理任务"),
         BotCommand("check", "立即检测已有任务镜像更新"),
         BotCommand("update", "自动升级 Bot 程序自身"),
         BotCommand("status", "查看当前任务池与运行状态"),
