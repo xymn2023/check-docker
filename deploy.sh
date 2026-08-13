@@ -15,7 +15,7 @@ MAIN_SCRIPT="autoupdate_bot.py"
 WATCHDOG_SCRIPT="watchdog.py"
 
 # GitHub 仓库原生文件下载 Base URL
-GITHUB_RAW_URL="https://raw.githubusercontent.com/xymn2023/check-docker/main"
+GITHUB_RAW_URL="https://raw.githubusercontent.com/xymn2023/check-docker/master"
 
 # 颜色输出控制
 RED='\033[0;31m'
