@@ -24,6 +24,12 @@ logging.basicConfig(
 DATA_DIR = "/opt/docker-update-bot"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 TASKS_FILE = os.path.join(DATA_DIR, "tasks.json")
+VERSION_FILE = os.path.join(DATA_DIR, ".version")
+UPDATING_MARKER_FILE = os.path.join(DATA_DIR, ".updating_msg")
+
+# 源码 GitHub 仓库配置
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/xymn2023/check-docker/main"
+GITHUB_API_URL = "https://api.github.com/repos/xymn2023/check-docker/commits/main"
 
 CHECK_INTERVAL = 3600
 
@@ -133,16 +139,16 @@ def build_scan_keyboard(chat_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-# ----------------🔒 核心鉴权锁 ----------------
+# ---------------- 🔒 权限校验锁 ----------------
 async def check_is_owner(update: Update) -> bool:
-    """只有 ALLOWED_CHAT_ID 可以使用"""
+    """仅允许 ALLOWED_CHAT_ID 使用，彻底屏蔽陌生人"""
     if not update or not update.effective_chat:
         return False
 
     incoming_chat_id = str(update.effective_chat.id)
 
     if incoming_chat_id != str(ALLOWED_CHAT_ID):
-        logging.warning(f"⛔ 拒绝陌生人使用: {incoming_chat_id}")
+        logging.warning(f"⛔ 拒绝陌生人访问: {incoming_chat_id}")
         if update.message:
             await update.message.reply_text("⛔ *未授权*：您无权限使用此 Bot！", parse_mode="Markdown")
         elif update.callback_query:
@@ -160,7 +166,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "可用命令：\n"
         "• /scan - 扫描当前运行的 Docker 镜像并设置监控\n"
         "• /check - 立即触发一轮镜像更新巡检\n"
-        "• /status - 查看当前监控池与系统运行状态",
+        "• /status - 查看当前监控池与系统运行状态\n"
+        "• /update - 自动升级程序并重启",
         parse_mode="Markdown"
     )
 
@@ -251,6 +258,65 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# ---------------- 🚀 彻底修复死锁的 /update 逻辑 ----------------
+async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_is_owner(update): return
+    msg = await update.message.reply_text("🔎 *[1/4] 正在连接 GitHub API 校验远程版本...*", parse_mode="Markdown")
+
+    code, api_out = run_cmd(f"curl -s -m 10 {GITHUB_API_URL}")
+    if code != 0 or '"sha"' not in api_out:
+        await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 无法连接 GitHub API，更新已取消。")
+        return
+
+    try:
+        remote_sha = json.loads(api_out)["sha"][:7]
+    except Exception:
+        remote_sha = "unknown"
+
+    local_sha = ""
+    if os.path.exists(VERSION_FILE):
+        with open(VERSION_FILE, "r") as f: local_sha = f.read().strip()
+
+    if local_sha == remote_sha and local_sha != "":
+        await context.bot.edit_message_text(
+            chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id,
+            text=f"🟢 *当前已是最新版本，无需升级！*\n📌 Commit: `{local_sha}`", parse_mode="Markdown"
+        )
+        return
+
+    save_tasks_to_disk()
+    await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text=f"🚀 *[2/4] 检测到新版本 ({remote_sha})，正在下载源码...*", parse_mode="Markdown")
+
+    # 1. 覆盖代码
+    code1, _ = run_cmd(f"curl -fsSL -m 15 {GITHUB_RAW_URL}/autoupdate_bot.py -o {DATA_DIR}/autoupdate_bot.py")
+    if code1 != 0:
+        await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=msg.message_id, text="❌ 源码拉取失败，请检查网络。")
+        return
+
+    with open(VERSION_FILE, "w") as f: f.write(remote_sha)
+
+    # 2. 写入成功标记
+    try:
+        with open(UPDATING_MARKER_FILE, "w", encoding="utf-8") as f:
+            json.dump({"chat_id": ALLOWED_CHAT_ID, "sha": remote_sha}, f)
+    except Exception as e:
+        logging.error(f"写入标记文件失败: {e}")
+
+    # 3. 编辑第 [3/4] 步消息（完全同截图）
+    await context.bot.edit_message_text(
+        chat_id=ALLOWED_CHAT_ID,
+        message_id=msg.message_id,
+        text="⚙️ *[3/4] 最新源码覆盖成功！*\n🔄 正在请求 Systemd 重启服务，请等待 5 秒...",
+        parse_mode="Markdown"
+    )
+
+    await asyncio.sleep(1)
+
+    # 4. 关键：后台唤醒 Systemd，当前 Python 进程使用 os._exit(0) 强制闪退，绝不卡死！
+    subprocess.Popen("sleep 1 && systemctl restart docker-update-bot.service", shell=True, start_new_session=True)
+    os._exit(0)
+
+
 async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
     global is_updating, last_check_time
     if is_updating:
@@ -322,9 +388,37 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application):
     load_tasks_from_disk()
+
+    # 🚀 完全复刻截图提示逻辑：重启成功后发送新消息！
+    if os.path.exists(UPDATING_MARKER_FILE):
+        try:
+            with open(UPDATING_MARKER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            chat_id = data.get("chat_id")
+            sha = data.get("sha", "unknown")
+            docker_status = "🟢 正常" if check_docker_daemon() else "🔴 异常"
+
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🚀 *Bot 服务启动成功！*\n-----------------------------\n"
+                    f"📌 代码 Commit: `{sha}`\n"
+                    f"🎯 已加载任务: `{len(monitored_images)}` 个\n"
+                    f"⚙️ Docker 引擎: {docker_status}"
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"发送重启成功消息失败: {e}")
+        finally:
+            if os.path.exists(UPDATING_MARKER_FILE):
+                os.remove(UPDATING_MARKER_FILE)
+
     await application.bot.set_my_commands([
         BotCommand("scan", "扫描容器镜像"),
         BotCommand("check", "检测镜像更新"),
+        BotCommand("update", "升级程序自身"),
         BotCommand("status", "查看运行状态"),
     ])
 
@@ -338,6 +432,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("check", cmd_manual_check))
+    app.add_handler(CommandHandler("update", cmd_update_self))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
 
