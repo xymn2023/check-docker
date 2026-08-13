@@ -12,7 +12,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 # 日志输出控制
@@ -41,7 +43,7 @@ ALLOWED_CHAT_ID = ""
 
 
 def load_config() -> bool:
-    """读取本地 config.json 配置，不存在或无效时返回 False"""
+    """读取本地 config.json 配置"""
     global TELEGRAM_BOT_TOKEN, ALLOWED_CHAT_ID
 
     env_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -49,7 +51,7 @@ def load_config() -> bool:
 
     if env_token and env_chat:
         TELEGRAM_BOT_TOKEN = env_token
-        ALLOWED_CHAT_ID = env_chat
+        ALLOWED_CHAT_ID = str(env_chat).strip()
         return True
 
     if os.path.exists(CONFIG_FILE):
@@ -106,28 +108,18 @@ def check_docker_daemon() -> bool:
 
 
 def is_valid_docker_image_name(image_name: str) -> bool:
-    """
-    【核心优化】校验 Docker 镜像名称是否属于合规的、可从云端仓库 Pull 的正规镜像名
-    """
+    """校验 Docker 镜像名称是否属于合规的标准 Repository/Image 名"""
     if not image_name or not isinstance(image_name, str):
         return False
 
     image_name = image_name.strip()
 
-    # 1. 过滤悬空镜像/无名镜像
     if "<none>" in image_name:
         return False
 
-    # 2. 过滤纯 16 进制 Hash ID（如 1487abffa4fa 或 64位长ID）
     if re.fullmatch(r"[0-9a-fA-F]+", image_name):
         return False
 
-    # 3. 匹配 Docker 官方标准镜像名称正则 (支持 域名/用户名/仓库名:标签)
-    # 允许格式:
-    # - mysql:5.7.22
-    # - louislam/uptime-kuma:latest
-    # - ghcr.io/snailyp/gemini-balance:latest
-    # - nginx
     pattern = r"^(?:[a-zA-Z0-9.-]+(?::[0-9]+)?/)?(?:[a-zA-Z0-9_.-]+/)?[a-zA-Z0-9_.-]+(?::[a-zA-Z0-9_.-]+)?$"
     if not re.match(pattern, image_name):
         return False
@@ -136,10 +128,7 @@ def is_valid_docker_image_name(image_name: str) -> bool:
 
 
 def get_running_docker_images() -> list[str]:
-    """
-    【核心优化】实时获取当前服务器运行中容器的标准镜像列表
-    排除匿名的 Image ID，自动补齐缺失的 :latest 标签
-    """
+    """实时获取当前服务器运行中容器的标准镜像列表"""
     code, out = run_cmd("docker ps --format '{{.Image}}'")
     if code != 0 or not out.strip():
         return []
@@ -148,12 +137,10 @@ def get_running_docker_images() -> list[str]:
     for line in out.split("\n"):
         img = line.strip()
         if is_valid_docker_image_name(img):
-            # 如果没有显示指定 Tag（例如直接运行 nginx），自动补齐 :latest 方便比对
             if ":" not in img.split("/")[-1]:
                 img = f"{img}:latest"
             valid_images.append(img)
 
-    # 去重并保持原始顺序
     return list(dict.fromkeys(valid_images))
 
 
@@ -177,19 +164,57 @@ def build_scan_keyboard(chat_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-async def auth_check(update: Update) -> bool:
-    if str(update.effective_chat.id) != str(ALLOWED_CHAT_ID):
-        if update.message:
-            await update.message.reply_text("⛔ 无权使用此 Bot。")
+# ==============================================================================
+# 🛡️【绝对权限校验门禁】只有 ALLOWED_CHAT_ID 允许通过，其余一律拒绝并断开
+# ==============================================================================
+async def check_is_owner(update: Update) -> bool:
+    """
+    检查发起调用的 ChatID 是否等于 ALLOWED_CHAT_ID。
+    若不匹配：直接对请求者回复无权限提示，并返回 False 彻底切断后面代码的执行。
+    """
+    if not update or not update.effective_chat:
         return False
+
+    incoming_chat_id = str(update.effective_chat.id)
+
+    if incoming_chat_id != str(ALLOWED_CHAT_ID):
+        user_info = update.effective_user.username if update.effective_user else "Unknown"
+        logging.warning(f"⛔ [非法请求已拦截] 来自未经授权的 ChatID: {incoming_chat_id} (User: @{user_info})")
+
+        # 仅向非法请求者发送无权限提示
+        if update.message:
+            await update.message.reply_text("⛔ *未授权*：您无权限使用此 Bot！", parse_mode="Markdown")
+        elif update.callback_query:
+            await update.callback_query.answer("⛔ 未授权：禁止操作！", show_alert=True)
+
+        return False
+
     return True
 
 
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/scan 实时扫描当前容器的正规镜像"""
-    if not await auth_check(update): return
-    chat_id = update.effective_chat.id
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start 命令"""
+    if not await check_is_owner(update):
+        return  # 陌生人发起：直接返回，主账号完全感知不到且不受影响
 
+    await update.message.reply_text(
+        "👋 *欢迎使用 Docker 镜像自动更新 Bot！*\n\n"
+        "👑 *身份验证成功：主账号管理员*\n\n"
+        "可用命令：\n"
+        "• /scan - 扫描当前运行的 Docker 镜像并设置监控\n"
+        "• /check - 立即触发一轮镜像更新巡检\n"
+        "• /status - 查看当前监控池与系统运行状态\n"
+        "• /update - 自动升级 Bot 程序源码",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scan 扫描命令"""
+    if not await check_is_owner(update):
+        return  # 陌生人发起：直接返回，主账号完全感知不到且不受影响
+
+    chat_id = update.effective_chat.id
     msg = await update.message.reply_text("🔎 正在实时检索服务器运行中的 Docker 容器镜像...", parse_mode="Markdown")
 
     if not check_docker_daemon():
@@ -207,14 +232,13 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 构建勾选状态：如果该标准镜像已在 monitored_images 监控池中，默认勾选 ☑️
     new_scan_state = {}
     for img in current_running_images:
         new_scan_state[img] = (img in monitored_images)
 
     scan_temp_state[chat_id] = new_scan_state
 
-    reply_markup = build_scan_keyboard(chat_id)
+    reply_markup = build_scan_keyboard(str(chat_id))
     await context.bot.edit_message_text(
         chat_id=chat_id,
         message_id=msg.message_id,
@@ -225,10 +249,13 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """按钮点击交互"""
+    if not await check_is_owner(update):
+        return
+
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat_id
-    if str(chat_id) != str(ALLOWED_CHAT_ID): return
+    chat_id = str(query.message.chat_id)
 
     data = query.data
     state = scan_temp_state.get(chat_id, {})
@@ -260,7 +287,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await auth_check(update): return
+    """/status 命令"""
+    if not await check_is_owner(update):
+        return
+
     docker_ok = "🟢 正常响应" if check_docker_daemon() else "🔴 异常或未启动"
     selected_text = "\n".join([f"• `{img}`" for img in monitored_images]) if monitored_images else "（未配置）"
     status_str = "🔄 更新中..." if is_updating else "💤 待命巡检"
@@ -275,8 +305,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/update 脚本自我升级逻辑"""
-    if not await auth_check(update): return
+    """/update 自身程序升级命令（极度敏感，仅主账号可触发）"""
+    if not await check_is_owner(update):
+        return
 
     msg = await update.message.reply_text("🔎 *[1/4] 正在检查 GitHub 上的最新发布代码...*", parse_mode="Markdown")
 
@@ -329,6 +360,7 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
+    """自动巡检/手动触发巡检逻辑（严格针对 ALLOWED_CHAT_ID 发送反馈）"""
     global is_updating, last_check_time
     if is_updating:
         if manual: await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 当前已有检测任务在进行中。")
@@ -405,6 +437,19 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
         is_updating = False
 
 
+async def cmd_manual_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/check 命令"""
+    if not await check_is_owner(update):
+        return  # 陌生人发起：直接返回，主账号完全感知不到且不受影响
+
+    await execute_update_check(context, manual=True)
+
+
+async def handle_unknown_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """陌生人发送任何随机文本/未定义指令时进行拦截"""
+    await check_is_owner(update)
+
+
 async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
     await execute_update_check(context, manual=False)
 
@@ -444,11 +489,16 @@ def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
+    # 注册命令处理
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("scan", cmd_scan))
-    app.add_handler(CommandHandler("check", lambda u, c: execute_update_check(c, manual=True)))
+    app.add_handler(CommandHandler("check", cmd_manual_check))
     app.add_handler(CommandHandler("update", cmd_update_self))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CallbackQueryHandler(handle_callback_query))
+
+    # 兜底拦截器：未定义的任何文本或命令消息
+    app.add_handler(MessageHandler(filters.ALL, handle_unknown_messages))
 
     if app.job_queue:
         app.job_queue.run_repeating(scheduled_job, interval=CHECK_INTERVAL, first=30)
