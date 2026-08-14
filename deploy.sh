@@ -10,6 +10,7 @@ PLAIN='\033[0m'
 INSTALL_DIR="/opt/docker-update-bot"
 CONFIG_FILE="${INSTALL_DIR}/config.json"
 SERVICE_FILE="/etc/systemd/system/docker-update-bot.service"
+VENV_DIR="${INSTALL_DIR}/venv"
 REPO_RAW_URL="https://raw.githubusercontent.com/xymn2023/check-docker/main"
 
 if [[ $EUID -ne 0 ]]; then
@@ -27,8 +28,10 @@ get_status() {
     fi
 }
 
+# -------------------- Python 虚拟环境与依赖 --------------------
+
 install_python_deps() {
-    echo -e "${BLUE}📦 正在检查并安装 Python 依赖...${PLAIN}"
+    echo -e "${BLUE}📦 正在检查并安装 Python 运行环境与依赖...${PLAIN}"
 
     # 确保 python3 和 pip3 可用
     if ! command -v python3 &> /dev/null; then
@@ -45,6 +48,14 @@ install_python_deps() {
         fi
     fi
 
+    # 确保 venv 模块可用
+    if ! python3 -c "import venv" &> /dev/null; then
+        echo -e "${YELLOW}正在安装 python3-venv...${PLAIN}"
+        if command -v apt-get &> /dev/null; then
+            apt-get install -y -qq python3-venv
+        fi
+    fi
+
     # 确保 pip3 可用
     if ! command -v pip3 &> /dev/null; then
         echo -e "${YELLOW}正在安装 pip3...${PLAIN}"
@@ -53,19 +64,21 @@ install_python_deps() {
         fi
     fi
 
-    # 在安装目录创建虚拟环境（避免系统 Python 包冲突）
-    if [ ! -d "${INSTALL_DIR}/venv" ]; then
+    # 创建虚拟环境
+    if [ ! -d "${VENV_DIR}" ]; then
         echo -e "${BLUE}🔧 正在创建 Python 虚拟环境...${PLAIN}"
-        python3 -m venv "${INSTALL_DIR}/venv"
+        python3 -m venv "${VENV_DIR}"
     fi
 
-    # 安装依赖到虚拟环境
-    echo -e "${BLUE}📥 正在安装 python-telegram-bot[job-queue] 和 requests...${PLAIN}"
-    "${INSTALL_DIR}/venv/bin/pip" install --upgrade pip -q
-    "${INSTALL_DIR}/venv/bin/pip" install "python-telegram-bot[job-queue]>=20.0" "requests>=2.28.0" -q
+    # 安装依赖（不再需要 [job-queue]，定时任务已改用 asyncio 原生实现）
+    echo -e "${BLUE}📥 正在安装 python-telegram-bot 和 requests...${PLAIN}"
+    "${VENV_DIR}/bin/pip" install --upgrade pip -q
+    "${VENV_DIR}/bin/pip" install "python-telegram-bot>=20.0" "requests>=2.28.0" -q
 
     echo -e "${GREEN}✅ Python 依赖安装完成。${PLAIN}"
 }
+
+# -------------------- 代码拉取与服务部署 --------------------
 
 do_fetch_code() {
     echo -e "${BLUE}📥 正在从 GitHub 拉取最新程序文件...${PLAIN}"
@@ -74,6 +87,15 @@ do_fetch_code() {
 }
 
 do_deploy_service() {
+    # 自动选择 Python 解释器：优先使用 venv，回退到系统 python3
+    local PYTHON_BIN="${VENV_DIR}/bin/python"
+    if [ ! -x "${PYTHON_BIN}" ]; then
+        PYTHON_BIN="/usr/bin/python3"
+        echo -e "${YELLOW}⚠️ 未找到虚拟环境 Python，回退到系统 Python: ${PYTHON_BIN}${PLAIN}"
+    else
+        echo -e "${BLUE}🐍 使用虚拟环境 Python: ${PYTHON_BIN}${PLAIN}"
+    fi
+
     cat <<EOF > ${SERVICE_FILE}
 [Unit]
 Description=Docker Auto Update Telegram Bot
@@ -83,7 +105,7 @@ Requires=docker.service
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/watchdog.py
+ExecStart=${PYTHON_BIN} ${INSTALL_DIR}/watchdog.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -96,6 +118,8 @@ EOF
     systemctl enable docker-update-bot.service
     systemctl restart docker-update-bot.service
 }
+
+# -------------------- 安装流程 --------------------
 
 install_bot() {
     echo -e "\n${GREEN}========================================="
@@ -130,11 +154,22 @@ EOF
     echo -e "${GREEN}💡 发送 /scan 扫描并选择要监控的镜像。${PLAIN}\n"
 }
 
+# -------------------- 更新代码（同时重建 service 文件和依赖） --------------------
+
 update_code() {
-    echo -e "\n${BLUE}正在更新 Bot 程序源码...${PLAIN}"
+    echo -e "\n${BLUE}正在更新 Bot 程序源码并重建服务配置...${PLAIN}"
+
+    # 1. 确保虚拟环境和依赖是最新的
+    install_python_deps
+
+    # 2. 拉取最新代码
     do_fetch_code
-    systemctl restart docker-update-bot.service
+
+    # 3. 重新生成 systemd service 文件（关键：确保 ExecStart 指向 venv Python）
+    do_deploy_service
+
     echo -e "${GREEN}✅ 程序更新成功，服务已重启！${PLAIN}"
+    echo -e "${GREEN}💡 请在 Telegram 中查看启动消息，确认「自动巡检」显示为 🟢 已启用。${PLAIN}"
 }
 
 reconfig() {
@@ -162,6 +197,34 @@ show_logs() {
     journalctl -u docker-update-bot.service -n 50 -f
 }
 
+# -------------------- 修复功能（解决旧版安装的 service 文件指向系统 Python 的问题） --------------------
+
+repair_installation() {
+    echo -e "\n${YELLOW}🔧 正在修复安装（重建虚拟环境、依赖和服务配置）...${PLAIN}"
+
+    mkdir -p ${INSTALL_DIR}
+
+    # 检查配置文件是否存在
+    if [ ! -f "${CONFIG_FILE}" ]; then
+        echo -e "${RED}❌ 未找到配置文件 ${CONFIG_FILE}，请先完成初始安装。${PLAIN}"
+        return
+    fi
+
+    # 重新安装依赖
+    install_python_deps
+
+    # 如果代码文件不存在则拉取
+    if [ ! -f "${INSTALL_DIR}/autoupdate_bot.py" ]; then
+        do_fetch_code
+    fi
+
+    # 重新生成 service 文件（确保使用 venv Python）
+    do_deploy_service
+
+    echo -e "${GREEN}✅ 修复完成！服务已使用虚拟环境 Python 重新启动。${PLAIN}"
+    echo -e "${GREEN}💡 请在 Telegram 中发送 /status 确认「自动巡检」显示为 🟢 运行中。${PLAIN}"
+}
+
 uninstall_bot() {
     echo -e "\n${RED}⚠️ 警告：卸载将完全擦除所有程序文件、Token 配置以及保存的镜像任务！${PLAIN}"
     read -p "确定要彻底卸载吗？(y/N): " confirm
@@ -185,16 +248,18 @@ show_menu() {
     echo -e "=========================================${PLAIN}"
     echo -e "服务状态: $(get_status)"
     echo -e "安装路径: ${INSTALL_DIR}"
+    echo -e "虚拟环境: ${VENV_DIR}"
     echo "-----------------------------------------"
     echo " 1. 查看运行状态 / 日志"
-    echo " 2. 更新 Bot 程序代码"
+    echo " 2. 更新 Bot 程序代码（含重建服务配置）"
     echo " 3. 修改 Token / Chat ID 配置"
     echo " 4. 重启 Bot 服务"
     echo " 5. 停止 Bot 服务"
     echo " 6. 彻底卸载程序 (清除所有文件)"
+    echo " 7. 修复安装（重建 venv/依赖/service）"
     echo " 0. 退出菜单"
     echo "-----------------------------------------"
-    read -p "请输入数字选择 [0-6]: " choice
+    read -p "请输入数字选择 [0-7]: " choice
 
     case "$choice" in
         1) show_logs ;;
@@ -209,6 +274,7 @@ show_menu() {
             echo -e "${YELLOW}⏸️ 服务已停止。${PLAIN}"
             ;;
         6) uninstall_bot ;;
+        7) repair_installation ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入错误，请输入有效数字！${PLAIN}" ;;
     esac

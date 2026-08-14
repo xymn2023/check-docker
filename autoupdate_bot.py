@@ -7,6 +7,7 @@ import subprocess
 import asyncio
 import logging
 from datetime import datetime
+from types import SimpleNamespace
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -33,6 +34,7 @@ GITHUB_RAW_URL = "https://raw.githubusercontent.com/xymn2023/check-docker/main"
 GITHUB_API_URL = "https://api.github.com/repos/xymn2023/check-docker/commits/main"
 
 CHECK_INTERVAL = 3600  # 自动巡检间隔时间 (秒)
+FIRST_RUN_DELAY = 30   # 启动后首次巡检延迟 (秒)
 
 monitored_images = set()
 scan_temp_state = {}
@@ -41,8 +43,9 @@ last_check_time = "尚未执行"
 TELEGRAM_BOT_TOKEN = ""
 ALLOWED_CHAT_ID = ""
 
-# 标记定时巡检是否成功注册
-job_queue_enabled = False
+# 定时巡检工作线程状态
+patrol_worker_running = False
+patrol_worker_task = None
 
 
 def load_config() -> bool:
@@ -185,7 +188,7 @@ def get_image_detail(image_name: str) -> dict:
         return detail
 
     try:
-        # docker inspect 可能输出多行，取第一行 JSON
+        # docker inspect --format 对每个结果输出一行 JSON，取第一行
         json_str = out.split("\n")[0].strip()
         info = json.loads(json_str)
 
@@ -334,14 +337,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     docker_ok = "🟢 正常响应" if check_docker_daemon() else "🔴 异常或未启动"
     selected_text = "\n".join([f"• `{img}`" for img in monitored_images]) if monitored_images else "（未配置）"
     status_str = "🔄 更新中..." if is_updating else "💤 待命巡检"
-    patrol_str = "🟢 已启用" if job_queue_enabled else "🔴 未启用（自动巡检不可用！）"
+    patrol_str = "🟢 运行中" if patrol_worker_running else "🔴 未运行"
 
     msg = (
         f"📊 *Docker 镜像自动更新服务状态*\n-----------------------------\n"
         f"⚙️ Docker 引擎: *{docker_ok}*\n"
         f"⏰ 自动巡检: *{patrol_str}*\n"
-        f"⏱️ 巡检间隔: `{CHECK_INTERVAL}s`\n"
-        f"🕐 上次检测: `{last_check_time}`\n"
+        f"🕒 巡检间隔: `{CHECK_INTERVAL}s`\n"
+        f"⏱️ 上次检测: `{last_check_time}`\n"
         f"📌 状态: *{status_str}*\n\n"
         f"🎯 *当前保存生效的监控任务 ({len(monitored_images)} 个):*\n{selected_text}\n\n"
         f"💡 /scan 重新扫描 | /check 立即检测 | /update 升级程序"
@@ -618,14 +621,55 @@ async def handle_unknown_messages(update: Update, context: ContextTypes.DEFAULT_
     await auth_check(update)
 
 
-async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
-    """后台定时巡检任务"""
-    logging.info("⏰ 定时巡检任务触发，开始自动检测镜像更新...")
-    await execute_update_check(context, manual=False)
+# ==================== 原生 asyncio 定时巡检（不依赖 JobQueue/APScheduler） ====================
+
+async def scheduled_patrol_worker(bot: "Bot"):
+    """
+    后台定时巡检工作协程
+    使用 asyncio.sleep 实现精确定时，完全不依赖 python-telegram-bot 的 JobQueue 组件，
+    因此无需安装 APScheduler，避免因依赖缺失导致自动巡检静默失效。
+    """
+    global patrol_worker_running
+    patrol_worker_running = True
+    logging.info(f"✅ 定时巡检协程已启动，启动后 {FIRST_RUN_DELAY} 秒执行首次巡检，之后每隔 {CHECK_INTERVAL} 秒巡检一次。")
+
+    # 构造一个简易 context 对象，execute_update_check 只需要 context.bot
+    fake_context = SimpleNamespace(bot=bot)
+
+    try:
+        # 首次延迟
+        await asyncio.sleep(FIRST_RUN_DELAY)
+
+        while True:
+            try:
+                logging.info("⏰ [定时巡检] 触发自动检测...")
+                await execute_update_check(fake_context, manual=False)
+            except asyncio.CancelledError:
+                logging.info("🛑 定时巡检协程收到取消信号，正在退出...")
+                break
+            except Exception as e:
+                logging.error(f"❌ 定时巡检发生未捕获异常: {e}")
+                try:
+                    await bot.send_message(
+                        chat_id=ALLOWED_CHAT_ID,
+                        text=f"🚨 *[定时巡检] 发生异常！*\n`{str(e)[:300]}`",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+
+            # 等待下一次巡检间隔
+            await asyncio.sleep(CHECK_INTERVAL)
+
+    except asyncio.CancelledError:
+        logging.info("🛑 定时巡检协程已取消。")
+    finally:
+        patrol_worker_running = False
+        logging.info("🛑 定时巡检协程已停止。")
 
 
 async def post_init(application: Application):
-    global job_queue_enabled
+    global patrol_worker_task
     load_tasks_from_disk()
 
     await application.bot.set_my_commands([
@@ -640,46 +684,48 @@ async def post_init(application: Application):
     if os.path.exists(VERSION_FILE):
         with open(VERSION_FILE, "r") as f: current_ver = f.read().strip()
 
-    # 检查 JobQueue 是否可用
-    job_queue_enabled = application.job_queue is not None
-    patrol_status = "🟢 已启用" if job_queue_enabled else "🔴 未启用（自动巡检不可用！）"
-
     is_upgrade = os.getenv("IS_SELF_UPGRADE", "false") == "true"
     title = "🎉 *[4/4] Bot 自身升级完成！*" if is_upgrade else "🚀 *Bot 服务启动成功！*"
 
+    # 启动原生 asyncio 定时巡检协程（不依赖 JobQueue / APScheduler）
+    patrol_worker_task = application.create_task(scheduled_patrol_worker(application.bot))
+
     if ALLOWED_CHAT_ID:
-        msg_text = (
-            f"{title}\n------------------------------------\n"
-            f"📌 代码 Commit: `{current_ver}`\n"
-            f"🎯 已加载任务: *{len(monitored_images)} 个*\n"
-            f"⚙️ Docker 引擎: *{docker_status}*\n"
-            f"⏰ 自动巡检: *{patrol_status}*\n"
-            f"🕒 巡检间隔: `{CHECK_INTERVAL}s`"
-        )
-
-        if not job_queue_enabled:
-            msg_text += (
-                "\n\n🚨 *警告：定时巡检功能未能启动！*\n"
-                "原因：缺少 APScheduler 依赖（JobQueue 组件）。\n"
-                "请在服务器上执行：\n"
-                f"`{DATA_DIR}/venv/bin/pip install \"python-telegram-bot[job-queue]\"`\n"
-                "然后重启服务：`systemctl restart docker-update-bot`"
-            )
-
         await application.bot.send_message(
             chat_id=ALLOWED_CHAT_ID,
-            text=msg_text,
+            text=f"{title}\n------------------------------------\n"
+                 f"📌 代码 Commit: `{current_ver}`\n"
+                 f"🎯 已加载任务: *{len(monitored_images)} 个*\n"
+                 f"⚙️ Docker 引擎: *{docker_status}*\n"
+                 f"⏰ 自动巡检: *🟢 已启用（asyncio 原生定时）*\n"
+                 f"🕒 巡检间隔: `{CHECK_INTERVAL}s`\n"
+                 f"⏱️ 首次巡检: 启动后 `{FIRST_RUN_DELAY}s`",
             parse_mode="Markdown"
         )
 
 
-def main():
-    global job_queue_enabled
+async def post_shutdown(application: Application):
+    """应用关闭时清理定时巡检协程"""
+    global patrol_worker_task
+    if patrol_worker_task and not patrol_worker_task.done():
+        patrol_worker_task.cancel()
+        try:
+            await patrol_worker_task
+        except asyncio.CancelledError:
+            pass
 
+
+def main():
     if not load_config():
         sys.exit(1)
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     # 注册常用命令
     app.add_handler(CommandHandler("start", cmd_start))
@@ -692,24 +738,8 @@ def main():
     # 全局死锁兜底：任何陌生人发任何消息均触发 auth_check 静默/警告拦截
     app.add_handler(MessageHandler(filters.ALL, handle_unknown_messages))
 
-    # 配置定时巡检任务 (JobQueue)
-    # 注意：python-telegram-bot v20+ 的 JobQueue 需要单独安装 APScheduler 依赖
-    # pip install "python-telegram-bot[job-queue]"
-    # 如果未安装，app.job_queue 为 None，定时任务会静默失败
-    if app.job_queue:
-        app.job_queue.run_repeating(scheduled_job, interval=CHECK_INTERVAL, first=30)
-        job_queue_enabled = True
-        logging.info(f"✅ 定时巡检任务已注册，间隔 {CHECK_INTERVAL} 秒（首次执行在启动后 30 秒）")
-    else:
-        job_queue_enabled = False
-        logging.error(
-            "❌❌❌ JobQueue 不可用！自动巡检功能无法启动！\n"
-            "原因：未安装 APScheduler 依赖。\n"
-            "请执行: pip3 install \"python-telegram-bot[job-queue]\"\n"
-            "然后重启服务: systemctl restart docker-update-bot"
-        )
-
-    print("🚀 Telegram Docker Update Bot 已启动，正在监听命令与定时任务...")
+    print("🚀 Telegram Docker Update Bot 已启动，正在监听命令...")
+    print(f"⏰ 自动巡检将在启动后 {FIRST_RUN_DELAY} 秒开始，间隔 {CHECK_INTERVAL} 秒（使用 asyncio 原生定时，无需 APScheduler）")
     app.run_polling()
 
 
