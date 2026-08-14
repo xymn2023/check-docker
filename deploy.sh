@@ -27,6 +27,46 @@ get_status() {
     fi
 }
 
+install_python_deps() {
+    echo -e "${BLUE}📦 正在检查并安装 Python 依赖...${PLAIN}"
+
+    # 确保 python3 和 pip3 可用
+    if ! command -v python3 &> /dev/null; then
+        echo -e "${YELLOW}正在安装 python3...${PLAIN}"
+        if command -v apt-get &> /dev/null; then
+            apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-venv
+        elif command -v yum &> /dev/null; then
+            yum install -y python3 python3-pip
+        elif command -v dnf &> /dev/null; then
+            dnf install -y python3 python3-pip
+        else
+            echo -e "${RED}❌ 无法自动安装 python3，请手动安装后重试。${PLAIN}"
+            exit 1
+        fi
+    fi
+
+    # 确保 pip3 可用
+    if ! command -v pip3 &> /dev/null; then
+        echo -e "${YELLOW}正在安装 pip3...${PLAIN}"
+        if command -v apt-get &> /dev/null; then
+            apt-get install -y -qq python3-pip
+        fi
+    fi
+
+    # 在安装目录创建虚拟环境（避免系统 Python 包冲突）
+    if [ ! -d "${INSTALL_DIR}/venv" ]; then
+        echo -e "${BLUE}🔧 正在创建 Python 虚拟环境...${PLAIN}"
+        python3 -m venv "${INSTALL_DIR}/venv"
+    fi
+
+    # 安装依赖到虚拟环境
+    echo -e "${BLUE}📥 正在安装 python-telegram-bot[job-queue] 和 requests...${PLAIN}"
+    "${INSTALL_DIR}/venv/bin/pip" install --upgrade pip -q
+    "${INSTALL_DIR}/venv/bin/pip" install "python-telegram-bot[job-queue]>=20.0" "requests>=2.28.0" -q
+
+    echo -e "${GREEN}✅ Python 依赖安装完成。${PLAIN}"
+}
+
 do_fetch_code() {
     echo -e "${BLUE}📥 正在从 GitHub 拉取最新程序文件...${PLAIN}"
     curl -fsSL ${REPO_RAW_URL}/autoupdate_bot.py -o ${INSTALL_DIR}/autoupdate_bot.py
@@ -43,7 +83,7 @@ Requires=docker.service
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=/usr/bin/python3 ${INSTALL_DIR}/watchdog.py
+ExecStart=${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/watchdog.py
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -80,10 +120,14 @@ install_bot() {
 EOF
     echo -e "${GREEN}✅ 配置已写入: ${CONFIG_FILE}${PLAIN}"
 
+    # 先安装 Python 依赖（venv），再拉代码和部署服务
+    install_python_deps
     do_fetch_code
     do_deploy_service
 
     echo -e "\n${GREEN}🎉 安装完成！服务已在后台成功启动。${PLAIN}"
+    echo -e "${GREEN}💡 发送 /status 到 Bot 检查运行状态。${PLAIN}"
+    echo -e "${GREEN}💡 发送 /scan 扫描并选择要监控的镜像。${PLAIN}\n"
 }
 
 update_code() {
@@ -156,11 +200,11 @@ show_menu() {
         1) show_logs ;;
         2) update_code ;;
         3) reconfig ;;
-        4) 
+        4)
             systemctl restart docker-update-bot.service
             echo -e "${GREEN}✅ 服务重启成功！${PLAIN}"
             ;;
-        5) 
+        5)
             systemctl stop docker-update-bot.service
             echo -e "${YELLOW}⏸️ 服务已停止。${PLAIN}"
             ;;

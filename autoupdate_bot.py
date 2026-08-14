@@ -41,6 +41,9 @@ last_check_time = "尚未执行"
 TELEGRAM_BOT_TOKEN = ""
 ALLOWED_CHAT_ID = ""
 
+# 标记定时巡检是否成功注册
+job_queue_enabled = False
+
 
 def load_config() -> bool:
     """读取本地 config.json 配置，不存在或无效时返回 False"""
@@ -155,6 +158,63 @@ def get_running_docker_images() -> list[str]:
 def get_image_digest(image_name: str) -> str:
     code, out = run_cmd(f"docker inspect --format='{{{{index .RepoDigests 0}}}}' {image_name}")
     return out.split("\n")[0] if code == 0 and out else ""
+
+
+def get_image_detail(image_name: str) -> dict:
+    """
+    获取镜像的详细版本信息：digest、创建日期、版本标签、OCI 标签等
+    用于在更新通知中展示版本号和更新内容线索
+    """
+    detail = {
+        "digest": "",
+        "short_digest": "unknown",
+        "created": "",
+        "version": "",
+        "source": "",
+        "revision": "",
+    }
+
+    # 获取 digest
+    detail["digest"] = get_image_digest(image_name)
+    if "@" in detail["digest"]:
+        detail["short_digest"] = detail["digest"].split("@")[-1][:19]
+
+    # 使用 docker inspect 获取完整信息
+    code, out = run_cmd(f"docker inspect --format '{{{{json .}}}}' {image_name}")
+    if code != 0 or not out.strip():
+        return detail
+
+    try:
+        # docker inspect 可能输出多行，取第一行 JSON
+        json_str = out.split("\n")[0].strip()
+        info = json.loads(json_str)
+
+        # 创建日期
+        created = info.get("Created", "")
+        if created:
+            # 格式: 2024-01-15T10:30:00Z -> 2024-01-15
+            detail["created"] = created.split("T")[0]
+
+        # 从 Config.Labels 提取 OCI 标准版本信息
+        labels = info.get("Config", {}).get("Labels", {}) or {}
+        detail["version"] = (
+            labels.get("org.opencontainers.image.version", "")
+            or labels.get("version", "")
+            or labels.get("org.label-schema.version", "")
+        )
+        detail["revision"] = (
+            labels.get("org.opencontainers.image.revision", "")
+            or labels.get("org.label-schema.vcs-ref", "")
+        )
+        detail["source"] = (
+            labels.get("org.opencontainers.image.source", "")
+            or labels.get("org.label-schema.url", "")
+            or labels.get("org.opencontainers.image.url", "")
+        )
+    except Exception as e:
+        logging.debug(f"解析镜像 {image_name} 详情失败: {e}")
+
+    return detail
 
 
 def build_scan_keyboard(chat_id: str) -> InlineKeyboardMarkup:
@@ -274,10 +334,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     docker_ok = "🟢 正常响应" if check_docker_daemon() else "🔴 异常或未启动"
     selected_text = "\n".join([f"• `{img}`" for img in monitored_images]) if monitored_images else "（未配置）"
     status_str = "🔄 更新中..." if is_updating else "💤 待命巡检"
+    patrol_str = "🟢 已启用" if job_queue_enabled else "🔴 未启用（自动巡检不可用！）"
 
     msg = (
         f"📊 *Docker 镜像自动更新服务状态*\n-----------------------------\n"
-        f"⚙️ Docker 引擎: *{docker_ok}*\n⏱️ 上次检测: `{last_check_time}`\n📌 状态: *{status_str}*\n\n"
+        f"⚙️ Docker 引擎: *{docker_ok}*\n"
+        f"⏰ 自动巡检: *{patrol_str}*\n"
+        f"⏱️ 巡检间隔: `{CHECK_INTERVAL}s`\n"
+        f"🕐 上次检测: `{last_check_time}`\n"
+        f"📌 状态: *{status_str}*\n\n"
         f"🎯 *当前保存生效的监控任务 ({len(monitored_images)} 个):*\n{selected_text}\n\n"
         f"💡 /scan 重新扫描 | /check 立即检测 | /update 升级程序"
     )
@@ -339,9 +404,15 @@ async def cmd_update_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
+    """
+    核心更新检测逻辑
+    - manual=True: 手动触发，显示逐条进度，最后发送完整汇总
+    - manual=False: 自动巡检，无更新时静默跳过；发现更新时立即通知并发送汇总
+    """
     global is_updating, last_check_time
     if is_updating:
-        if manual: await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 当前已有检测任务在进行中。")
+        if manual:
+            await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 当前已有检测任务在进行中。")
         return
 
     if not check_docker_daemon():
@@ -349,7 +420,8 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
         return
 
     if not monitored_images:
-        if manual: await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 任务池为空，请先运行 /scan 重新扫描并勾选镜像。")
+        if manual:
+            await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="⚠️ 任务池为空，请先运行 /scan 重新扫描并勾选镜像。")
         return
 
     is_updating = True
@@ -357,6 +429,9 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
     images_list = list(monitored_images)
     total_count = len(images_list)
     progress_msg = None
+
+    # 记录本次巡检中发现更新的镜像（用于自动模式汇总通知）
+    updated_items = []
 
     if manual:
         progress_msg = await context.bot.send_message(
@@ -367,6 +442,7 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
     results_summary = []
     try:
         for idx, img in enumerate(images_list, 1):
+            # 手动模式：更新进度消息
             if manual and progress_msg:
                 try:
                     await context.bot.edit_message_text(
@@ -374,43 +450,160 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
                         text=f"🔎 *[ {idx}/{total_count} ] 正在检测：* `{img}`\n\n📥 对比远程 Registry 校验码...",
                         parse_mode="Markdown"
                     )
-                except Exception: pass
+                except Exception:
+                    pass
 
+            # 记录更新前的镜像信息
             old_digest = get_image_digest(img)
-            pull_code, _ = run_cmd(f"docker pull {img}")
-            new_digest = get_image_digest(img)
+            old_detail = get_image_detail(img)
 
-            if pull_code == 0 and old_digest != new_digest:
+            # 拉取镜像（如果远程有新版本则会实际下载）
+            pull_code, pull_out = run_cmd(f"docker pull {img}")
+
+            # 获取更新后的镜像信息
+            new_digest = get_image_digest(img)
+            new_detail = get_image_detail(img)
+
+            has_update = pull_code == 0 and old_digest != new_digest and new_digest != ""
+
+            if has_update:
+                # 构造版本信息文本
+                version_info = ""
+                if new_detail["version"]:
+                    version_info += f"\n🏷️ 版本标签: `{new_detail['version']}`"
+                if new_detail["created"]:
+                    version_info += f"\n📅 构建日期: `{new_detail['created']}`"
+                if new_detail["revision"]:
+                    version_info += f"\n🔖 Git Commit: `{new_detail['revision'][:12]}`"
+                if new_detail["source"]:
+                    version_info += f"\n🔗 源码地址: {new_detail['source']}"
+
+                digest_info = f"`{old_detail['short_digest']}...` → `{new_detail['short_digest']}...`"
+
+                # 手动模式：编辑进度消息
                 if manual and progress_msg:
                     try:
                         await context.bot.edit_message_text(
                             chat_id=ALLOWED_CHAT_ID, message_id=progress_msg.message_id,
-                            text=f"🔄 *[ {idx}/{total_count} ] 发现新版本！* `{img}`\n\n⚙️ 正在拉取镜像并重启关联容器...",
+                            text=f"🔄 *[ {idx}/{total_count} ] 发现新版本！* `{img}`\n\n"
+                                 f"📦 Digest 变更: {digest_info}"
+                                 f"{version_info}\n\n"
+                                 f"⚙️ 正在重启关联容器...",
                             parse_mode="Markdown"
                         )
-                    except Exception: pass
+                    except Exception:
+                        pass
+                # 自动模式：立即发送更新通知
+                else:
+                    await context.bot.send_message(
+                        chat_id=ALLOWED_CHAT_ID,
+                        text=f"🔄 *[自动巡检] 发现镜像更新！* `{img}`\n\n"
+                             f"📦 Digest 变更: {digest_info}"
+                             f"{version_info}\n\n"
+                             f"⚙️ 正在重启关联容器...",
+                        parse_mode="Markdown"
+                    )
 
-                code, container_names = run_cmd(f"docker ps -q --filter ancestor={img} | xargs -r docker inspect --format '{{{{.Name}}}}'")
+                # 查找使用该镜像的运行中容器并重启
+                code, container_names = run_cmd(
+                    f"docker ps -q --filter ancestor={img} | xargs -r docker inspect --format '{{{{.Name}}}}'"
+                )
                 clean_names = [name.lstrip("/") for name in container_names.split("\n") if name.strip()]
 
                 failed = False
+                restart_details = []
                 for c_name in clean_names:
                     r_code, _ = run_cmd(f"docker restart {c_name}")
-                    if r_code != 0: failed = True
+                    if r_code != 0:
+                        failed = True
+                        restart_details.append(f"  ❌ `{c_name}` 重启失败")
+                    else:
+                        restart_details.append(f"  ✅ `{c_name}` 已重启")
 
-                res_str = f"✅ `{img}` -> 已更新并成功重启" if not failed else f"⚠️ `{img}` -> 已拉取更新，部分容器重启失败"
+                restart_text = "\n".join(restart_details) if restart_details else "  （无关联运行中容器）"
+
+                if not failed:
+                    res_str = f"✅ `{img}` -> 已更新并成功重启"
+                else:
+                    res_str = f"⚠️ `{img}` -> 已拉取更新，部分容器重启失败"
+
+                updated_items.append({
+                    "image": img,
+                    "old_digest": old_detail["short_digest"],
+                    "new_digest": new_detail["short_digest"],
+                    "version": new_detail["version"],
+                    "created": new_detail["created"],
+                    "restart_text": restart_text,
+                    "failed": failed,
+                })
+
+                # 自动模式：单镜像更新完成通知
+                if not manual:
+                    icon = "✅" if not failed else "⚠️"
+                    await context.bot.send_message(
+                        chat_id=ALLOWED_CHAT_ID,
+                        text=f"{icon} *[自动巡检] 镜像更新完成！* `{img}`\n\n"
+                             f"🔄 容器重启状态:\n{restart_text}",
+                        parse_mode="Markdown"
+                    )
             else:
-                res_str = f"🟢 `{img}` -> 已是最新版本"
+                if pull_code != 0:
+                    res_str = f"❌ `{img}` -> 拉取失败"
+                else:
+                    res_str = f"🟢 `{img}` -> 已是最新版本"
 
             results_summary.append(res_str)
             await asyncio.sleep(0.5)
 
-        summary_text = f"🏁 *{total_count} 个镜像检测完成！*\n\n" + "\n".join(results_summary)
+        # 手动模式：发送完整汇总（编辑进度消息）
         if manual and progress_msg:
-            await context.bot.edit_message_text(chat_id=ALLOWED_CHAT_ID, message_id=progress_msg.message_id, text=summary_text, parse_mode="Markdown")
+            summary_text = f"🏁 *{total_count} 个镜像检测完成！*\n⏱️ 时间: `{last_check_time}`\n\n" + "\n".join(results_summary)
+            await context.bot.edit_message_text(
+                chat_id=ALLOWED_CHAT_ID,
+                message_id=progress_msg.message_id,
+                text=summary_text,
+                parse_mode="Markdown"
+            )
+
+        # 自动模式：如果有更新，发送汇总通知；无更新则静默跳过
+        if not manual and updated_items:
+            auto_summary = (
+                f"🏁 *[自动巡检] 本次巡检完成！*\n"
+                f"⏱️ 检测时间: `{last_check_time}`\n"
+                f"📊 共检测 {total_count} 个镜像，{len(updated_items)} 个有更新\n\n"
+            )
+            for item in updated_items:
+                icon = "✅" if not item["failed"] else "⚠️"
+                ver = f" (v{item['version']})" if item["version"] else ""
+                auto_summary += (
+                    f"{icon} *{item['image']}*{ver}\n"
+                    f"  📦 `{item['old_digest']}...` → `{item['new_digest']}...`\n"
+                    f"{item['restart_text']}\n\n"
+                )
+            await context.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text=auto_summary,
+                parse_mode="Markdown"
+            )
 
     except Exception as e:
         logging.error(f"更新异常: {e}")
+        if manual and progress_msg:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=ALLOWED_CHAT_ID,
+                    message_id=progress_msg.message_id,
+                    text=f"❌ *检测过程中发生异常！*\n`{str(e)[:300]}`",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+        elif not manual:
+            await context.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text=f"🚨 *[自动巡检] 检测过程中发生异常！*\n`{str(e)[:300]}`",
+                parse_mode="Markdown"
+            )
     finally:
         is_updating = False
 
@@ -426,10 +619,13 @@ async def handle_unknown_messages(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
+    """后台定时巡检任务"""
+    logging.info("⏰ 定时巡检任务触发，开始自动检测镜像更新...")
     await execute_update_check(context, manual=False)
 
 
 async def post_init(application: Application):
+    global job_queue_enabled
     load_tasks_from_disk()
 
     await application.bot.set_my_commands([
@@ -444,21 +640,42 @@ async def post_init(application: Application):
     if os.path.exists(VERSION_FILE):
         with open(VERSION_FILE, "r") as f: current_ver = f.read().strip()
 
+    # 检查 JobQueue 是否可用
+    job_queue_enabled = application.job_queue is not None
+    patrol_status = "🟢 已启用" if job_queue_enabled else "🔴 未启用（自动巡检不可用！）"
+
     is_upgrade = os.getenv("IS_SELF_UPGRADE", "false") == "true"
     title = "🎉 *[4/4] Bot 自身升级完成！*" if is_upgrade else "🚀 *Bot 服务启动成功！*"
 
     if ALLOWED_CHAT_ID:
+        msg_text = (
+            f"{title}\n------------------------------------\n"
+            f"📌 代码 Commit: `{current_ver}`\n"
+            f"🎯 已加载任务: *{len(monitored_images)} 个*\n"
+            f"⚙️ Docker 引擎: *{docker_status}*\n"
+            f"⏰ 自动巡检: *{patrol_status}*\n"
+            f"🕒 巡检间隔: `{CHECK_INTERVAL}s`"
+        )
+
+        if not job_queue_enabled:
+            msg_text += (
+                "\n\n🚨 *警告：定时巡检功能未能启动！*\n"
+                "原因：缺少 APScheduler 依赖（JobQueue 组件）。\n"
+                "请在服务器上执行：\n"
+                f"`{DATA_DIR}/venv/bin/pip install \"python-telegram-bot[job-queue]\"`\n"
+                "然后重启服务：`systemctl restart docker-update-bot`"
+            )
+
         await application.bot.send_message(
             chat_id=ALLOWED_CHAT_ID,
-            text=f"{title}\n------------------------------------\n"
-                 f"📌 代码 Commit: `{current_ver}`\n"
-                 f"🎯 已加载任务: *{len(monitored_images)} 个*\n"
-                 f"⚙️ Docker 引擎: *{docker_status}*",
+            text=msg_text,
             parse_mode="Markdown"
         )
 
 
 def main():
+    global job_queue_enabled
+
     if not load_config():
         sys.exit(1)
 
@@ -475,9 +692,24 @@ def main():
     # 全局死锁兜底：任何陌生人发任何消息均触发 auth_check 静默/警告拦截
     app.add_handler(MessageHandler(filters.ALL, handle_unknown_messages))
 
+    # 配置定时巡检任务 (JobQueue)
+    # 注意：python-telegram-bot v20+ 的 JobQueue 需要单独安装 APScheduler 依赖
+    # pip install "python-telegram-bot[job-queue]"
+    # 如果未安装，app.job_queue 为 None，定时任务会静默失败
     if app.job_queue:
         app.job_queue.run_repeating(scheduled_job, interval=CHECK_INTERVAL, first=30)
+        job_queue_enabled = True
+        logging.info(f"✅ 定时巡检任务已注册，间隔 {CHECK_INTERVAL} 秒（首次执行在启动后 30 秒）")
+    else:
+        job_queue_enabled = False
+        logging.error(
+            "❌❌❌ JobQueue 不可用！自动巡检功能无法启动！\n"
+            "原因：未安装 APScheduler 依赖。\n"
+            "请执行: pip3 install \"python-telegram-bot[job-queue]\"\n"
+            "然后重启服务: systemctl restart docker-update-bot"
+        )
 
+    print("🚀 Telegram Docker Update Bot 已启动，正在监听命令与定时任务...")
     app.run_polling()
 
 
