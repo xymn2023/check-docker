@@ -98,8 +98,8 @@ systemctl restart docker-update-bot     # 重启服务
 调整巡检间隔：编辑 `autoupdate_bot.py` 顶部的常量后重启服务：
 
 ```python
-CHECK_INTERVAL = 36000   # 自动巡检间隔（秒）
-FIRST_RUN_DELAY = 60    # 启动后首次巡检延迟（秒）
+CHECK_INTERVAL = 3600   # 自动巡检间隔（秒）
+FIRST_RUN_DELAY = 30    # 启动后首次巡检延迟（秒）
 ```
 
 ```bash
