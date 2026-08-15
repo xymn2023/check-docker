@@ -568,20 +568,30 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
                 parse_mode="Markdown"
             )
 
-        # 自动模式：如果有更新，发送汇总通知；无更新则静默跳过
-        if not manual and updated_items:
-            auto_summary = (
-                f"🏁 *[自动巡检] 本次巡检完成！*\n"
-                f"⏱️ 检测时间: `{last_check_time}`\n"
-                f"📊 共检测 {total_count} 个镜像，{len(updated_items)} 个有更新\n\n"
-            )
-            for item in updated_items:
-                icon = "✅" if not item["failed"] else "⚠️"
-                ver = f" (v{item['version']})" if item["version"] else ""
-                auto_summary += (
-                    f"{icon} *{item['image']}*{ver}\n"
-                    f"  📦 `{item['old_digest']}...` → `{item['new_digest']}...`\n"
-                    f"{item['restart_text']}\n\n"
+        # 自动模式：无论是否有更新，都发送巡检结果通知
+        if not manual:
+            if updated_items:
+                auto_summary = (
+                    f"🏁 *[自动巡检] 本次巡检完成！*\n"
+                    f"⏱️ 检测时间: `{last_check_time}`\n"
+                    f"📊 共检测 {total_count} 个镜像，{len(updated_items)} 个有更新\n\n"
+                )
+                for item in updated_items:
+                    icon = "✅" if not item["failed"] else "⚠️"
+                    ver = f" (v{item['version']})" if item["version"] else ""
+                    auto_summary += (
+                        f"{icon} *{item['image']}*{ver}\n"
+                        f"  📦 `{item['old_digest']}...` → `{item['new_digest']}...`\n"
+                        f"{item['restart_text']}\n\n"
+                    )
+            else:
+                no_update_list = "\n".join(results_summary) if results_summary else "（无监控任务）"
+                auto_summary = (
+                    f"✅ *[自动巡检] 本次巡检完成，所有镜像均已是最新版本！*\n"
+                    f"⏱️ 检测时间: `{last_check_time}`\n"
+                    f"📊 共检测 {total_count} 个镜像，0 个需要更新\n\n"
+                    f"{no_update_list}\n\n"
+                    f"💡 自动巡检运行正常，下次巡检将在 `{CHECK_INTERVAL}s` 后执行。"
                 )
             await context.bot.send_message(
                 chat_id=ALLOWED_CHAT_ID,
