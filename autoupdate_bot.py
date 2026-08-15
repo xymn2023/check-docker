@@ -36,8 +36,8 @@ VERSION_FILE = os.path.join(DATA_DIR, ".version")
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/xymn2023/check-docker/main"
 GITHUB_API_URL = "https://api.github.com/repos/xymn2023/check-docker/commits/main"
 
-CHECK_INTERVAL = 3600  # 自动巡检间隔时间 (秒)
-FIRST_RUN_DELAY = 30   # 启动后首次巡检延迟 (秒)
+CHECK_INTERVAL = 36000  # 自动巡检间隔时间 (秒)
+FIRST_RUN_DELAY = 60   # 启动后首次巡检延迟 (秒)
 
 monitored_images = set()
 scan_temp_state = {}
