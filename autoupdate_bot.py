@@ -6,8 +6,11 @@ import re
 import subprocess
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from types import SimpleNamespace
+
+# 锁定时区为 Asia/Shanghai (UTC+8)，无论服务器在哪个时区都显示北京时间
+SHANGHAI_TZ = timezone(timedelta(hours=8))
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -428,7 +431,7 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
         return
 
     is_updating = True
-    last_check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    last_check_time = datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
     images_list = list(monitored_images)
     total_count = len(images_list)
     progress_msg = None
