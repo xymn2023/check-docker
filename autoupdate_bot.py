@@ -36,8 +36,8 @@ VERSION_FILE = os.path.join(DATA_DIR, ".version")
 GITHUB_RAW_URL = "https://raw.githubusercontent.com/xymn2023/check-docker/main"
 GITHUB_API_URL = "https://api.github.com/repos/xymn2023/check-docker/commits/main"
 
-CHECK_INTERVAL = 3600  # 自动巡检间隔时间 (秒)
-FIRST_RUN_DELAY = 30   # 启动后首次巡检延迟 (秒)
+CHECK_INTERVAL = 36000  # 自动巡检间隔时间 (秒) = 10 小时
+FIRST_RUN_DELAY = 60    # 启动后首次巡检延迟 (秒) = 1 分钟
 
 monitored_images = set()
 scan_temp_state = {}
@@ -330,7 +330,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
 
         selected_text = "\n".join([f"• `{img}`" for img in monitored_images]) if monitored_images else "（当前未选择任何任务）"
         await query.edit_message_text(
-            f"✅ *监控任务池已成功同步保存！*\n\n📌 当前已激活监控 ({len(monitored_images)} 个):\n{selected_text}\n\n⏱️ 系统将每隔 `{CHECK_INTERVAL}s` 自动巡检上述镜像。",
+            f"✅ *监控任务池已成功同步保存！*\n\n📌 当前已激活监控 ({len(monitored_images)} 个):\n{selected_text}\n\n⏱️ 系统将每隔 `{CHECK_INTERVAL // 3600}小时` 自动巡检上述镜像。",
             parse_mode="Markdown"
         )
 
@@ -346,7 +346,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 *Docker 镜像自动更新服务状态*\n-----------------------------\n"
         f"⚙️ Docker 引擎: *{docker_ok}*\n"
         f"⏰ 自动巡检: *{patrol_str}*\n"
-        f"🕒 巡检间隔: `{CHECK_INTERVAL}s`\n"
+        f"🕒 巡检间隔: `{CHECK_INTERVAL // 3600}小时`\n"
         f"⏱️ 上次检测: `{last_check_time}`\n"
         f"📌 状态: *{status_str}*\n\n"
         f"🎯 *当前保存生效的监控任务 ({len(monitored_images)} 个):*\n{selected_text}\n\n"
@@ -594,7 +594,7 @@ async def execute_update_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
                     f"⏱️ 检测时间: `{last_check_time}`\n"
                     f"📊 共检测 {total_count} 个镜像，0 个需要更新\n\n"
                     f"{no_update_list}\n\n"
-                    f"💡 自动巡检运行正常，下次巡检将在 `{CHECK_INTERVAL}s` 后执行。"
+                    f"💡 自动巡检运行正常，下次巡检将在 `{CHECK_INTERVAL // 3600}小时` 后执行。"
                 )
             await context.bot.send_message(
                 chat_id=ALLOWED_CHAT_ID,
@@ -711,8 +711,8 @@ async def post_init(application: Application):
                  f"🎯 已加载任务: *{len(monitored_images)} 个*\n"
                  f"⚙️ Docker 引擎: *{docker_status}*\n"
                  f"⏰ 自动巡检: *🟢 已启用（asyncio 原生定时）*\n"
-                 f"🕒 巡检间隔: `{CHECK_INTERVAL}s`\n"
-                 f"⏱️ 首次巡检: 启动后 `{FIRST_RUN_DELAY}s`",
+                 f"🕒 巡检间隔: `{CHECK_INTERVAL // 3600}小时`\n"
+                 f"⏱️ 首次巡检: 启动后 `{FIRST_RUN_DELAY // 60}分钟`",
             parse_mode="Markdown"
         )
 
@@ -752,7 +752,7 @@ def main():
     app.add_handler(MessageHandler(filters.ALL, handle_unknown_messages))
 
     print("🚀 Telegram Docker Update Bot 已启动，正在监听命令...")
-    print(f"⏰ 自动巡检将在启动后 {FIRST_RUN_DELAY} 秒开始，间隔 {CHECK_INTERVAL} 秒（使用 asyncio 原生定时，无需 APScheduler）")
+    print(f"⏰ 自动巡检将在启动后 {FIRST_RUN_DELAY // 60} 分钟开始，间隔 {CHECK_INTERVAL // 3600} 小时（使用 asyncio 原生定时，无需 APScheduler）")
     app.run_polling()
 
 
