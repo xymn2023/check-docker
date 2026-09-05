@@ -1,29 +1,16 @@
 #!/usr/bin/env bash
-set -e
-
-INSTALL_DIR="/opt/docker-update-bot"
-SERVICE_FILE="/etc/systemd/system/docker-update-bot.service"
-
-echo "⚠️  警告：此操作将彻底停止服务，并清空所有已保存的 Token、ChatID 以及镜像任务池！"
-read -p "确认卸载？(y/N): " confirm
-
-if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-    echo "操作已取消。"
-    exit 0
-fi
-
-echo "🛑 正在停止并禁用 Systemd 服务..."
+set -Eeuo pipefail
+[[ $EUID -eq 0 ]] || { echo '请以 root 运行'; exit 1; }
+echo '卸载 Bot 服务默认保留配置、事务和版本目录，不删除任何 Docker 容器、镜像或数据卷。'
+read -r -p '输入 UNINSTALL 确认: ' answer
+[[ "$answer" == UNINSTALL ]] || exit 0
 systemctl stop docker-update-bot.service || true
 systemctl disable docker-update-bot.service || true
-
-if [ -f "${SERVICE_FILE}" ]; then
-    rm -f ${SERVICE_FILE}
-    systemctl daemon-reload
+rm -f /etc/systemd/system/docker-update-bot.service
+systemctl daemon-reload
+echo '服务已卸载，/opt/docker-update-bot 保留。'
+read -r -p '如需连同配置和事务文件一起删除，输入 DELETE-DATA（否则回车）: ' answer
+if [[ "$answer" == DELETE-DATA ]]; then
+  rm -rf -- /opt/docker-update-bot
+  echo 'Bot 文件已删除；Docker 容器、镜像和卷未删除。'
 fi
-
-echo "🗑️ 正在清空并删除保存文件与程序目录: ${INSTALL_DIR} ..."
-rm -rf ${INSTALL_DIR}
-
-echo "========================================="
-echo "✅ 卸载完成！所有保存的配置文件和任务已被彻底清理。"
-echo "========================================="

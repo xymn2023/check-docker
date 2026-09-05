@@ -1,0 +1,13 @@
+{
+  "bot_token": "替换为BotFather提供的Token",
+  "chat_id": 123456789,
+  "allowed_user_ids": [123456789],
+  "check_interval": 36000,
+  "first_run_delay": 60,
+  "pull_timeout": 1800,
+  "command_timeout": 180,
+  "health_timeout": 120,
+  "stability_seconds": 15,
+  "notify_unchanged": false,
+  "compose_targets": {}
+}
