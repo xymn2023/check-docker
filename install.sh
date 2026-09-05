@@ -16,12 +16,12 @@ install_release() {
   done
   python3 -c 'import sys; assert sys.version_info >= (3,10), "需要 Python 3.10+"'
   docker info >/dev/null
-  docker compose version
+  docker compose version || echo '未检测到 Compose 插件；普通镜像更新可用，使用显式 Compose 目标前请安装插件。'
   mkdir -p "$INSTALL_DIR/releases"
   chmod 700 "$INSTALL_DIR" "$INSTALL_DIR/releases"
   local release previous old_service
-  release="$(mktemp -d "$INSTALL_DIR/releases/v2.0.0-XXXXXXXX")"
-  cp "$SOURCE_DIR/"{autoupdate_bot.py,core.py,admin.py,requirements.txt,requirements.lock,uninstall.sh} "$release/"
+  release="$(mktemp -d "$INSTALL_DIR/releases/v2.1.0-XXXXXXXX")"
+  cp "$SOURCE_DIR/"{autoupdate_bot.py,core.py,container_update.py,docker_api.py,admin.py,requirements.txt,requirements.lock,uninstall.sh} "$release/"
   if [[ -f "$SOURCE_DIR/.source-commit" ]]; then cp "$SOURCE_DIR/.source-commit" "$release/"; fi
   python3 -m venv "$release/venv"
   "$release/venv/bin/python" -m pip install -r "$release/requirements.lock"

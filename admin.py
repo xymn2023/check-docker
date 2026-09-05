@@ -30,8 +30,8 @@ def prepare(root):
         old = read_json(root / 'tasks.json', [])
         if not isinstance(old, list) or any(not isinstance(x, str) for x in old):
             raise ValueError('旧任务文件无效，已停止迁移；请修复 tasks.json')
-        atomic_json(target, ['legacy:' + x for x in old])
-    print(f'配置有效，允许 {len(cfg["allowed_user_ids"])} 个用户。旧任务保留为待映射项；请 /scan 重新选择容器。')
+        atomic_json(target, ['image:' + x for x in old])
+    print(f'配置有效，允许 {len(cfg["allowed_user_ids"])} 个用户。旧版镜像任务已接入自动更新；可用 /scan 管理勾选。')
 
 
 if __name__ == '__main__':

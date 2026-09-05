@@ -16,7 +16,7 @@ from core import Engine, VERSION, load_config, atomic_json, stamp
 LOG = logging.getLogger(__name__)
 PAGE_SIZE = 8
 STATUS = {'current': '🟢 最新', 'available': '📥 待更新', 'updated': '✅ 已更新',
-          'error': '❌ 失败', 'blocked': '⛔ 待处理', 'rolled_back': '↩️ 已恢复旧镜像', 'skipped': '⏭️ 跳过'}
+          'error': '❌ 失败', 'blocked': '⛔ 待处理', 'rolled_back': '↩️ 已恢复旧镜像', 'skipped': '⏭️ 跳过', 'cleanup': '🧹 清理结果'}
 
 
 class BotUI:
@@ -57,9 +57,9 @@ class BotUI:
             return
         await self.send(context.bot, f'check-docker {VERSION}\n'
                         '/scan 扫描并管理任务\n/check 立即巡检\n/status 状态及上次结果\n'
-                        '/ack 目标ID 确认已人工处理失败事务，允许再次更新\n'
+                        '/ack compose:目标ID 或 container:容器名 确认已人工处理失败事务，允许再次更新\n'
                         '/update 查看程序升级方式\n'
-                        '普通容器仅通知；Compose 是否自动更新由服务器 config.json 的 mode 控制。')
+                        '勾选镜像后自动巡检、拉取、重建；成功清理旧镜像，失败恢复旧容器。')
 
     async def status(self, update, context):
         if not self.authorized(update):
@@ -108,7 +108,7 @@ class BotUI:
         catalog = await self.engine.catalog()
         self.session = {'token': secrets.token_hex(4), 'items': list(catalog.items()),
                         'selected': set(self.engine.tasks), 'page': 0}
-        await update.message.reply_text('勾选监控目标（仅保存后生效；新扫描会使旧面板失效）：',
+        await update.message.reply_text('勾选需要自动更新的镜像（保存后生效；成功清理旧镜像，失败回滚）：',
                                         reply_markup=self.keyboard())
 
     async def callback(self, update, context):
@@ -150,7 +150,7 @@ class BotUI:
         if not self.authorized(update):
             return
         if len(context.args) != 1:
-            await self.send(context.bot, '用法：/ack 目标ID\n仅在服务器上检查并处理失败事务后使用。此命令不恢复服务，只解除自动更新阻止。')
+            await self.send(context.bot, '用法：/ack compose:目标ID 或 container:容器名\n仅在服务器上检查并处理失败事务后使用。此命令不恢复服务，只解除自动更新阻止。')
             return
         self.engine.acknowledge(context.args[0])
         await self.send(context.bot, '已确认处理。该目标将在下次巡检重新检查；现在没有执行容器操作。')

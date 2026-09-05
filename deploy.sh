@@ -79,7 +79,7 @@ with tarfile.open(archive,'r:gz') as tar:
         out.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
         with tar.extractfile(m) as f:
             out.write_bytes(f.read())
-for name in ('install.sh','uninstall.sh','core.py','autoupdate_bot.py','admin.py','requirements.txt','requirements.lock'):
+for name in ('install.sh','uninstall.sh','core.py','container_update.py','docker_api.py','autoupdate_bot.py','admin.py','requirements.txt','requirements.lock'):
     if not (root/name).is_file():
         raise SystemExit('仓库缺少 '+name+'；请上传新版项目根目录全部文件后重试')
 for p in root.glob('*.py'):
