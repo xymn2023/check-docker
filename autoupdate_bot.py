@@ -157,8 +157,9 @@ class BotUI:
 
     async def update_code(self, update, context):
         if self.authorized(update):
-            await self.send(context.bot, f'当前版本 {VERSION}。请将经过审核的新版本压缩包上传服务器，解压后执行 sudo bash deploy.sh。'
-                            '安装器会验证包内校验和、创建独立版本目录并保留旧版本。详细操作见 README.md。')
+            await self.send(context.bot, f'当前版本 {VERSION}。请在服务器以 root 重新执行一键命令，选择菜单 1 升级：\n'
+                            'bash <(curl -fsSL https://raw.githubusercontent.com/xymn2023/check-docker/main/deploy.sh)\n'
+                            '安装器会固定 GitHub Commit 下载，准备依赖后切换服务并保留旧版本。升级前请等待当前巡检完成。')
 
     async def on_error(self, update, context):
         LOG.error('Telegram handler failure: %s', type(context.error).__name__)
