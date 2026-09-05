@@ -8,15 +8,113 @@ from pathlib import Path
 import secrets
 import signal
 from zoneinfo import ZoneInfo
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 from core import Engine, VERSION, load_config, atomic_json, stamp
 
 LOG = logging.getLogger(__name__)
 PAGE_SIZE = 8
-STATUS = {'current': '🟢 最新', 'available': '📥 待更新', 'updated': '✅ 已更新',
+STATUS = {'current': '⏭️ 无更新，已跳过', 'available': '📥 待更新', 'updated': '✅ 已更新',
           'error': '❌ 失败', 'blocked': '⛔ 待处理', 'rolled_back': '↩️ 已恢复旧镜像', 'skipped': '⏭️ 跳过', 'cleanup': '🧹 清理结果'}
+CN_TZ = ZoneInfo('Asia/Shanghai')
+
+
+def cn_time(value=None):
+    value = value or datetime.now(CN_TZ)
+    return value.astimezone(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def interval_text(seconds):
+    if seconds % 3600 == 0:
+        return f'{seconds // 3600} 小时'
+    if seconds % 60 == 0:
+        return f'{seconds // 60} 分钟'
+    return f'{seconds} 秒'
+
+
+class ProgressMessage:
+    """Keep one live message per image, then send a complete run report."""
+    def __init__(self, ui, bot, run_type):
+        self.ui, self.bot, self.run_type = ui, bot, run_type
+        self.message = None
+        self.started = datetime.now(CN_TZ)
+        self.last_text = None
+        self.index = self.total = 0
+        self.task = None
+
+    async def start(self):
+        if not self.ui.engine.tasks:
+            self.message = await self.ui.send_message(self.bot, f'ℹ️【{self.run_type}巡检】没有已勾选的镜像任务')
+
+    async def replace(self, text, new=False):
+        if text == self.last_text:
+            return
+        self.last_text = text
+        if self.message and not new:
+            try:
+                await self.bot.edit_message_text(chat_id=self.ui.cfg['chat_id'], message_id=self.message.message_id, text=text)
+                return
+            except Exception:
+                LOG.warning('Could not edit progress message; sending a replacement')
+        self.message = await self.ui.send_message(self.bot, text)
+
+    def phase_text(self, title, detail):
+        return (f'{title}【{self.run_type}巡检】\n📦 镜像：{self.task}\n'
+                f'📊 进度：{self.index}/{self.total}\n{detail}\n'
+                f'🕒 更新时间：{cn_time()}（北京时间）')
+
+    async def __call__(self, event):
+        stage = event['stage']
+        if stage == 'checking_task':
+            self.task = event.get('task') or '未知镜像'
+            self.index, self.total = event.get('index', 0), event.get('total', 0)
+            await self.replace(self.phase_text('🔍', f'正在检测 {self.task} 是否有更新…'), new=True)
+            return
+        if stage.startswith('cleanup_'):
+            await self.ui.send(self.bot, f'🧹【{self.run_type}巡检·镜像清理】\n{event["message"]}\n🕒 {cn_time()}（北京时间）')
+            return
+        task = event.get('task') or self.task
+        if task and task != '镜像清理':
+            self.task = task
+        details = {
+            'inspecting': '📋 正在读取实际运行配置…',
+            'matched': '🔗 ' + event['message'],
+            'pulling': '🌐 正在查询远端仓库并检测新版本…',
+            'pulled': '📥 远端镜像获取完成，正在对比实际镜像 ID…',
+            'current': '🟢 镜像 ID 未变化，没有更新，本次已跳过。',
+            'stopping': (f'🆕 发现新版本\n旧镜像：{event.get("old_image", "未知")[:19]}\n'
+                         f'新镜像：{event.get("new_image", "未知")[:19]}\n⏸ 正在保留旧容器并准备重建…'),
+            'recreating': '🔄 新版本已拉取，正在重建并启动容器…',
+            'verifying': '🩺 容器已启动，正在验证镜像 ID、运行状态和健康状态…',
+            'rolling_back': f'⚠️ 新版本启动或验证失败\n↩️ 正在回滚到 {event.get("old_image", "原镜像")[:19]}…',
+            'verifying_rollback': '🛡 旧容器已启动，正在验证回滚结果…',
+            'cleanup': '🧹 更新任务已完成，正在安全清理旧容器和旧镜像…',
+        }
+        if stage == 'recreating' and event.get('old_image') and event.get('new_image'):
+            details['recreating'] = (f'🆕 发现新版本\n旧镜像：{event["old_image"][:19]}\n'
+                                     f'新镜像：{event["new_image"][:19]}\n'
+                                     '🔄 新版本已拉取，正在重建并启动容器…')
+        if stage == 'task_done':
+            status = event.get('status')
+            title = {'updated':'✅','current':'🟢','rolled_back':'↩️','error':'❌','blocked':'⛔','skipped':'⏭️'}.get(status, 'ℹ️')
+            await self.replace(self.phase_text(title, f'{STATUS.get(status, status)}\n{event.get("detail", event["message"])}'))
+        elif stage in details:
+            await self.replace(self.phase_text('⏳', details[stage]))
+
+    async def finish(self, results, next_time=None):
+        counts = {}
+        for row in results or []:
+            counts[row['status']] = counts.get(row['status'], 0) + 1
+        stats = '，'.join(f'{STATUS.get(k, k)} {v}' for k, v in counts.items()) or '无任务'
+        duration = max(0, int((datetime.now(CN_TZ) - self.started).total_seconds()))
+        text = (f'📋【{self.run_type}巡检】运行日志报告\n'
+                f'开始时间：{cn_time(self.started)}（北京时间）\n'
+                f'完成时间：{cn_time()}（北京时间）\n'
+                f'总耗时：{duration} 秒\n结果统计：{stats}\n\n' + self.ui.summary(results))
+        if next_time:
+            text += f'\n下次巡检：{cn_time(next_time)}（北京时间）'
+        await self.ui.send(self.bot, text)
 
 
 class BotUI:
@@ -25,6 +123,8 @@ class BotUI:
         self.cfg = engine.cfg
         self.session = None
         self.manual_task = None
+        self.current_progress = None
+        self.next_patrol_at = None
 
     def authorized(self, update):
         return bool(update.effective_chat and update.effective_user
@@ -45,12 +145,23 @@ class BotUI:
                     await asyncio.sleep(2 ** attempt)
         return True
 
+    async def send_message(self, bot, text):
+        """Send one control/progress message and return it for later edits."""
+        for attempt in range(3):
+            try:
+                return await bot.send_message(chat_id=self.cfg['chat_id'], text=text)
+            except Exception:
+                if attempt == 2:
+                    LOG.warning('Telegram progress message unavailable')
+                    return None
+                await asyncio.sleep(2 ** attempt)
+
     @staticmethod
     def summary(results):
         if not results:
             return '任务池为空。请 /scan 勾选监控目标。'
         return '巡检结果\n\n' + '\n\n'.join(
-            f"{STATUS.get(r['status'], r['status'])} · {r['task']}\n{r['detail']}" for r in results)
+            f"{STATUS.get(r['status'], r['status'])} · {r.get('display') or r['task']}\n{r['detail']}" for r in results)
 
     async def start(self, update, context):
         if not self.authorized(update):
@@ -67,9 +178,20 @@ class BotUI:
         last = self.engine.state.get('last_check')
         if last:
             last = datetime.fromisoformat(last).astimezone(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S 北京时间')
+        progress = self.current_progress.last_text if self.current_progress else None
+        next_line = f"\n下次巡检：{cn_time(self.next_patrol_at)}（北京时间）" if self.next_patrol_at else ''
+        try:
+            live = await self.engine.live_status()
+            live_text = ('\n\n'.join(f"镜像：{row['image']}\n容器：{row['name']}\n"
+                                     f"实际镜像 ID：{row['image_id']}\n状态：{row['state']}"
+                                     for row in live) or '当前没有 Docker 容器')
+        except Exception as exc:
+            live_text = f'实时读取 Docker 失败：{type(exc).__name__}: {exc}'
         await self.send(context.bot, f"check-docker {VERSION}\n状态：{'巡检中' if self.engine.lock.locked() else '待命'}\n"
                         f"监控目标：{len(self.engine.tasks)}\n间隔：{self.cfg['check_interval']} 秒\n"
-                        f"上次完成：{last or '尚未执行'}\n\n" + self.summary(self.engine.state.get('last_results', [])))
+                        f"上次完成时间：{last or '尚未执行'}{next_line}\n\n"
+                        + ((progress + '\n\n') if progress else '')
+                        + f'实时 Docker 状态（查询时间：{cn_time()} 北京时间）\n\n{live_text}')
 
     async def check(self, update, context):
         if not self.authorized(update):
@@ -78,14 +200,20 @@ class BotUI:
             await self.send(context.bot, '已有巡检执行中，请稍后查看 /status。')
             return
         async def work():
+            reporter = ProgressMessage(self, context.bot, '手动')
+            self.current_progress = reporter
             try:
-                await self.engine.check(lambda rows: self.send(context.bot, self.summary(rows)), manual=True)
+                await reporter.start()
+                rows = await self.engine.check(lambda result: asyncio.sleep(0),
+                                               manual=True, progress=reporter)
+                await reporter.finish(rows)
             except Exception:
                 LOG.exception('Patrol failed outside task execution')
                 await self.send(context.bot, '巡检异常，未能保存结果。请检查磁盘和服务日志。')
+            finally:
+                self.current_progress = None
         # Independent job keeps /status and callbacks responsive during pulls.
         self.manual_task = asyncio.create_task(work())
-        await self.send(context.bot, '已开始巡检，完成后发送汇总。')
 
     def keyboard(self):
         s = self.session
@@ -167,13 +295,30 @@ class BotUI:
             await self.send(context.bot, '操作未完成：请检查配置、磁盘和服务日志后重试；未确认写入的任务不会显示保存成功。')
 
     async def patrol(self, bot):
+        self.next_patrol_at = datetime.now(CN_TZ) + timedelta(seconds=self.cfg['first_run_delay'])
+        await self.send(bot, f'⏰ 定时巡检已安排\n'
+                             f'首次巡检：{cn_time(self.next_patrol_at)}（北京时间）\n'
+                             f'后续间隔：每 {interval_text(self.cfg["check_interval"])}\n'
+                             f'监控任务：{len(self.engine.tasks)} 个')
         await asyncio.sleep(self.cfg['first_run_delay'])
         while True:
+            reporter = ProgressMessage(self, bot, '定时')
+            self.current_progress = reporter
             try:
-                await self.engine.check(lambda rows: self.send(bot, self.summary(rows)))
+                await reporter.start()
+                rows = await self.engine.check(lambda result: asyncio.sleep(0),
+                                               manual=True, progress=reporter)
+                self.next_patrol_at = datetime.now(CN_TZ) + timedelta(seconds=self.cfg['check_interval'])
+                await reporter.finish(rows, self.next_patrol_at)
             except Exception:
                 LOG.exception('Scheduled patrol failed')
-                await self.send(bot, '巡检执行异常，请检查服务日志和磁盘；下一周期会重试。')
+                self.next_patrol_at = datetime.now(CN_TZ) + timedelta(seconds=self.cfg['check_interval'])
+                await self.send(bot, '❌ 定时巡检异常\n'
+                                     f'发生时间：{cn_time()}（北京时间）\n'
+                                     f'下次重试：{cn_time(self.next_patrol_at)}（北京时间）\n'
+                                     '请检查服务日志和磁盘。')
+            finally:
+                self.current_progress = None
             await asyncio.sleep(self.cfg['check_interval'])
 
 

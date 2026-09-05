@@ -19,15 +19,21 @@ install_release() {
   docker compose version || echo '未检测到 Compose 插件；普通镜像更新可用，使用显式 Compose 目标前请安装插件。'
   mkdir -p "$INSTALL_DIR/releases"
   chmod 700 "$INSTALL_DIR" "$INSTALL_DIR/releases"
-  local release previous old_service
-  release="$(mktemp -d "$INSTALL_DIR/releases/v2.1.0-XXXXXXXX")"
-  cp "$SOURCE_DIR/"{autoupdate_bot.py,core.py,container_update.py,docker_api.py,admin.py,requirements.txt,requirements.lock,uninstall.sh} "$release/"
+  local release previous old_service previous_venv
+  previous="$(readlink "$INSTALL_DIR/current" || true)"
+  previous_venv=''
+  if [[ -x "$INSTALL_DIR/current/venv/bin/python" ]]; then
+    previous_venv="$(readlink -f "$INSTALL_DIR/current/venv")"
+  fi
+  release="$(mktemp -d "$INSTALL_DIR/releases/v2.5.0-XXXXXXXX")"
+  cp "$SOURCE_DIR/"{autoupdate_bot.py,core.py,container_update.py,docker_api.py,admin.py,dependency_env.py,requirements.txt,requirements.lock,uninstall.sh} "$release/"
   if [[ -f "$SOURCE_DIR/.source-commit" ]]; then cp "$SOURCE_DIR/.source-commit" "$release/"; fi
-  python3 -m venv "$release/venv"
-  "$release/venv/bin/python" -m pip install -r "$release/requirements.lock"
+  dependency_args=(--lock "$release/requirements.lock" --target "$release/venv"
+                   --cache-root "$INSTALL_DIR/runtime-cache")
+  if [[ -n "$previous_venv" ]]; then dependency_args+=(--candidate "$previous_venv"); fi
+  python3 "$release/dependency_env.py" "${dependency_args[@]}"
   "$release/venv/bin/python" -c "import sys; sys.path.insert(0, '$release'); import core, autoupdate_bot"
   "$release/venv/bin/python" "$release/admin.py" --data-dir "$INSTALL_DIR"
-  previous="$(readlink "$INSTALL_DIR/current" || true)"
   old_service="$release/previous.service"
   if [[ -f "$SERVICE_FILE" ]]; then cp "$SERVICE_FILE" "$old_service"; fi
   rollback_activation() {

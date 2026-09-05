@@ -12,8 +12,18 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-VERSION = '2.1.0'
+VERSION = '2.5.0'
 LOG = logging.getLogger(__name__)
+
+
+async def emit(progress, stage, message, **fields):
+    """Publish a best-effort progress event without affecting Docker work."""
+    if not progress:
+        return
+    try:
+        await progress({'stage': stage, 'message': message, **fields})
+    except Exception:
+        LOG.warning('Progress notification failed at stage %s', stage)
 
 
 def stamp():
@@ -174,6 +184,37 @@ class Engine:
                                       'label=com.docker.compose.service=' + target['service'])
         return [c for c in items if (c['Config'].get('Labels') or {}).get('com.docker.compose.oneoff', '').lower() != 'true']
 
+    async def task_display(self, task):
+        """Resolve an internal task key to the actual image reference."""
+        from container_update import source_image
+        try:
+            if task.startswith('image:'):
+                return task[6:]
+            if task.startswith('container:'):
+                return source_image(await self.inspect(task[10:]))
+            if task.startswith('compose:'):
+                target = self.cfg['compose_targets'].get(task[8:])
+                items = await self.service_containers(target) if target else []
+                if items:
+                    return source_image(items[0])
+        except Exception:
+            pass
+        return task
+
+    async def live_status(self):
+        """Read live Docker container/image state instead of saved patrol results."""
+        from container_update import source_image
+        rows = []
+        for c in await self.containers():
+            state = c.get('State') or {}
+            status = '运行中' if state.get('Running') else '已停止'
+            health = state.get('Health', {}).get('Status')
+            if health:
+                status += '，健康状态：' + health
+            rows.append({'name': c['Name'].lstrip('/'), 'image': source_image(c),
+                         'image_id': c.get('Image', '')[:19], 'state': status})
+        return sorted(rows, key=lambda row: (row['image'], row['name']))
+
     async def catalog(self):
         from container_update import source_image
         choices = {'compose:' + k: f"Compose {t['project']}/{t['service']} [自动更新]"
@@ -205,15 +246,20 @@ class Engine:
         return json.loads(await self.run(self.compose_args(t) + ['config', '--format', 'json'],
                                         cwd=t['directory'], timeout=self.cfg['command_timeout']))
 
-    async def pull(self, reference, current):
+    async def pull(self, reference, current, progress=None, task=None):
         if reference.startswith(('sha256:', '-')) or '@sha256:' in reference or re.fullmatch(r'[0-9a-f]{12,64}', reference):
             raise ValueError('固定 Digest/镜像 ID 不追踪更新；请使用可拉取标签')
         info = await self.inspect(current['Image'], 'image')
         platform = '/'.join(str(info[k]) for k in ('Os', 'Architecture', 'Variant') if info.get(k))
+        await emit(progress, 'pulling', f'正在查询远端镜像 {reference}', task=task,
+                   old_image=current['Image'])
         await self.docker('pull', '--platform', platform, reference, timeout=self.cfg['pull_timeout'])
-        return (await self.inspect(reference, 'image'))['Id']
+        image_id = (await self.inspect(reference, 'image'))['Id']
+        await emit(progress, 'pulled', f'镜像获取完成，正在比较实际镜像 ID', task=task,
+                   old_image=current['Image'], new_image=image_id)
+        return image_id
 
-    async def check_container(self, name):
+    async def check_container(self, name, progress=None):
         from container_update import source_image, update
         if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_.-]*', name):
             raise ValueError('非法容器名')
@@ -221,14 +267,22 @@ class Engine:
         if not c['State']['Running']:
             return 'skipped', '容器已停止，保留监控任务'
         reference = source_image(c)
-        new = await self.pull(reference, c)
-        return await update(self, c, new, reference)
+        await emit(progress, 'inspecting', f'正在读取容器 {name} 的运行配置', task=reference)
+        new = await self.pull(reference, c, progress, reference)
+        current = await self.inspect(name)
+        if current['Id'] != c['Id']:
+            raise RuntimeError('拉取期间容器被替换，已取消本次操作')
+        if current['Image'] == new:
+            await emit(progress, 'current', f'镜像 ID 未变化，无更新，已跳过 {name}', task=reference)
+            return 'current', f'{name}：无更新，已跳过（镜像 ID：{new[:19]}）'
+        return await update(self, c, new, reference, progress)
 
-    async def check_image(self, reference):
+    async def check_image(self, reference, progress=None):
         from container_update import source_image, update
         items = [c for c in await self.containers('status=running') if source_image(c) == reference]
         if not items:
             return 'skipped', '没有关联的运行中容器；保留任务'
+        await emit(progress, 'matched', f'找到 {len(items)} 个关联运行容器', task=reference)
         results = []
         for c in items:
             try:
@@ -237,10 +291,18 @@ class Engine:
                                    if t['project'] == labels.get('com.docker.compose.project') and
                                    t['service'] == labels.get('com.docker.compose.service')), None)
                 if configured:
-                    result = await self.check_compose(configured)
+                    result = await self.check_compose(configured, progress)
                 else:
-                    new = await self.pull(reference, c)
-                    result = await update(self, c, new, reference)
+                    name = c['Name'].lstrip('/')
+                    new = await self.pull(reference, c, progress, reference)
+                    current = await self.inspect(name)
+                    if current['Id'] != c['Id']:
+                        raise RuntimeError('拉取期间容器被替换，已取消本次操作')
+                    if current['Image'] == new:
+                        await emit(progress, 'current', f'{name} 镜像 ID 未变化，无更新，已跳过', task=reference)
+                        result = ('current', f'{name}：无更新，已跳过（镜像 ID：{new[:19]}）')
+                    else:
+                        result = await update(self, c, new, reference, progress)
             except Exception as exc:
                 result = ('error', c['Name'].lstrip('/') + ': ' + str(exc))
             results.append(result)
@@ -248,10 +310,13 @@ class Engine:
         status = next(p for p in priority if any(r[0] == p for r in results))
         return status, '\n'.join(r[1] for r in results)
 
-    async def cleanup(self):
+    async def cleanup(self, progress=None):
         """Only remove successful backups and unused old images, never volumes/prune."""
         messages = []
         queue = self.state.setdefault('cleanup_images', [])
+        if any(tx.get('status') == 'completed' and tx.get('cleanup_pending')
+               for tx in self.state['transactions'].values()) or queue:
+            await emit(progress, 'cleanup', '正在检查可安全清理的旧容器和旧镜像', task='镜像清理')
         for tx in self.state['transactions'].values():
             if tx.get('status') != 'completed' or not tx.get('cleanup_pending'):
                 continue
@@ -266,7 +331,9 @@ class Engine:
                     if old['State']['Running'] or old['Name'].lstrip('/') != tx['backup_name']:
                         messages.append('保留旧容器：状态或名称被外部修改')
                         continue
+                    await emit(progress, 'cleanup_container', '正在删除已验证更新成功的旧容器：' + tx['backup_name'])
                     await self.docker('rm', old['Id'])  # Never -v or --force.
+                    await emit(progress, 'cleanup_container_done', '已删除旧容器：' + tx['backup_name'])
                 tx['cleanup_pending'] = False
                 if tx['old_image'] not in queue:
                     queue.append(tx['old_image'])
@@ -276,6 +343,7 @@ class Engine:
             try:
                 if any(c['Image'] == ident for c in await self.containers()):
                     messages.append('旧镜像仍有容器引用，暂时保留：' + ident[:19])
+                    await emit(progress, 'cleanup_image_kept', '旧镜像仍有容器引用，已安全保留：' + ident[:19])
                     continue
                 try:
                     info = await self.inspect(ident, 'image')
@@ -291,7 +359,9 @@ class Engine:
                 others = [t for t in tags if t not in owned]
                 if others:
                     messages.append('旧镜像仍有其他标签，保留：' + ident[:19])
+                    await emit(progress, 'cleanup_image_kept', '旧镜像仍有其他标签，已安全保留：' + ident[:19])
                     continue
+                await emit(progress, 'cleanup_image', '正在删除旧镜像：' + ident[:19])
                 for tag in owned:
                     await self.docker('image', 'rm', tag)
                 if not owned:
@@ -302,6 +372,7 @@ class Engine:
                     continue
                 queue.remove(ident)
                 messages.append('已清理旧镜像：' + ident[:19])
+                await emit(progress, 'cleanup_image_done', '已成功删除旧镜像：' + ident[:19])
             except Exception:
                 messages.append('旧镜像清理失败，保留并下次重试：' + ident[:19])
         self.persist()
@@ -349,7 +420,7 @@ class Engine:
             await asyncio.sleep(1)
         raise RuntimeError('容器镜像 ID、运行稳定性或健康检查未通过')
 
-    async def check_compose(self, key):
+    async def check_compose(self, key, progress=None):
         target = self.cfg['compose_targets'].get(key)
         if not target:
             raise ValueError('Compose 目标配置已移除；任务保留，请重新配置或取消勾选')
@@ -357,6 +428,7 @@ class Engine:
         tx = self.state['transactions'].get(task)
         if tx and tx['status'] in ('needs_review', 'applying', 'rolling_back'):
             return 'blocked', '上次事务需人工检查；处理后 /ack ' + key
+        await emit(progress, 'inspecting', f"正在读取 Compose 服务 {target['project']}/{target['service']}", task=task)
         before = self.require_single(await self.service_containers(target))
         model = await self.compose_config(target)
         service = model['services'][target['service']]
@@ -366,11 +438,12 @@ class Engine:
         if not reference:
             raise ValueError('服务没有 image；本版本不自动构建镜像')
         require_health = bool(before['State'].get('Health'))
-        new = await self.pull(reference, before)
+        new = await self.pull(reference, before, progress, reference)
         if tx and tx['status'] == 'rolled_back' and tx['new_image'] == new:
             return 'blocked', '此版本已回滚，其他新版本出现后自动重试；或 /ack ' + key
         if new == before['Image']:
-            return 'current', '运行中服务已使用最新镜像'
+            await emit(progress, 'current', '镜像 ID 未变化，无更新，已跳过', task=reference)
+            return 'current', f'无更新，已跳过（镜像 ID：{new[:19]}）'
         # Check identity and resolved configuration again after a potentially long pull.
         now = self.require_single(await self.service_containers(target))
         if now['Id'] != before['Id'] or now['Image'] != before['Image'] or await self.compose_config(target) != model:
@@ -389,7 +462,10 @@ class Engine:
         self.state['transactions'][task] = tx
         self.persist()  # Must succeed before touching the service.
         try:
+            await emit(progress, 'recreating', '发现新镜像，正在重建 Compose 服务', task=reference,
+                       old_image=before['Image'], new_image=new)
             await self.apply(target, model, new_tag, folder / 'apply.json')
+            await emit(progress, 'verifying', '新容器已启动，正在验证镜像 ID、运行状态和健康状态', task=reference)
             await self.verify(target, new, require_health)
         except (TimeoutError, asyncio.CancelledError):
             # Killing a Docker CLI cannot cancel daemon-side changes with certainty.
@@ -400,7 +476,10 @@ class Engine:
             tx['status'] = 'rolling_back'
             self.persist()
             try:
+                await emit(progress, 'rolling_back', '新版本验证失败，正在恢复旧镜像', task=reference,
+                           old_image=before['Image'], new_image=new)
                 await self.apply(target, model, old_tag, folder / 'rollback.json')
+                await emit(progress, 'verifying_rollback', '旧版本已启动，正在验证回滚结果', task=reference)
                 await self.verify(target, before['Image'], require_health)
             except Exception:
                 tx['status'] = 'needs_review'
@@ -417,28 +496,36 @@ class Engine:
         if before['Image'] not in queue:
             queue.append(before['Image'])
         self.persist()
-        return 'updated', '已重建容器，镜像 ID 和' + ('健康状态' if require_health else '运行稳定性（非业务健康）') + '验证通过'
+        return 'updated', (f'确认发现新镜像 {before["Image"][:19]} → {new[:19]}；已重建容器，镜像 ID 和'
+                           + ('健康状态' if require_health else '运行稳定性（非业务健康）') + '验证通过')
 
-    async def check(self, notify, manual=False):
+    async def check(self, notify, manual=False, progress=None):
         if self.lock.locked():
             return None
         async with self.lock:
             results = []
-            for task in list(self.tasks):
+            tasks = list(self.tasks)
+            total = len(tasks)
+            for index, task in enumerate(tasks, 1):
+                display = await self.task_display(task)
+                await emit(progress, 'checking_task', f'正在检查第 {index}/{total} 项',
+                           task=display, index=index, total=total)
                 try:
                     if task.startswith('compose:'):
-                        status, detail = await self.check_compose(task[8:])
+                        status, detail = await self.check_compose(task[8:], progress)
                     elif task.startswith('container:'):
-                        status, detail = await self.check_container(task[10:])
+                        status, detail = await self.check_container(task[10:], progress)
                     elif task.startswith('image:'):
-                        status, detail = await self.check_image(task[6:])
+                        status, detail = await self.check_image(task[6:], progress)
                     else:
                         raise ValueError('未知任务类型')
                 except Exception as exc:
                     status, detail = 'error', f'{type(exc).__name__}: {exc}'
                     LOG.warning('Task %s failed: %s', task, detail)
-                results.append({'task': task, 'status': status, 'detail': detail})
-            cleanup_messages = await self.cleanup()
+                results.append({'task': task, 'display': display, 'status': status, 'detail': detail})
+                await emit(progress, 'task_done', f"第 {index}/{total} 项完成：{status}",
+                           task=display, index=index, total=total, status=status, detail=detail)
+            cleanup_messages = await self.cleanup(progress)
             if cleanup_messages:
                 results.append({'task': '镜像清理', 'status': 'cleanup', 'detail': '\n'.join(cleanup_messages)})
             self.state['last_check'] = stamp()

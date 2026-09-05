@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 import time
 from urllib.parse import quote
-from core import atomic_json, stamp
+from core import atomic_json, stamp, emit
 
 SOURCE_LABEL = 'io.check-docker.source-image'
 TX_LABEL = 'io.check-docker.transaction'
@@ -113,7 +113,7 @@ def restart_arg(policy):
     return name
 
 
-async def update(engine, before, new_image, reference):
+async def update(engine, before, new_image, reference, progress=None):
     name = before['Name'].lstrip('/')
     task = 'container:' + name
     prior = engine.state['transactions'].get(task)
@@ -122,7 +122,8 @@ async def update(engine, before, new_image, reference):
     if prior and prior['status'] == 'rolled_back' and prior['new_image'] == new_image:
         return 'blocked', name + ' 已回滚此失败版本；其他新版本出现后自动重试，或 /ack container:' + name
     if before['Image'] == new_image:
-        return 'current', name + ' 已使用最新镜像'
+        await emit(progress, 'current', name + ' 镜像 ID 未变化，无更新，已跳过', task=reference)
+        return 'current', name + f'：无更新，已跳过（镜像 ID：{new_image[:19]}）'
     transaction = str(time.time_ns())
     payload = create_payload(before, new_image, reference, transaction)
     # Other containers referencing this one's ID/name cannot follow a replacement.
@@ -154,16 +155,21 @@ async def update(engine, before, new_image, reference):
     engine.state['transactions'][task] = tx
     engine.persist()
     try:
+        await emit(progress, 'stopping', '发现新镜像，正在安全停止并保留原容器 ' + name, task=reference,
+                   container=name, old_image=before['Image'], new_image=new_image)
         await engine.docker('update', '--restart', 'no', before['Id'])
         await engine.docker('stop', before['Id'])
         await engine.docker('rename', before['Id'], tx['backup_name'])
         for network in endpoints(before):
             if payload['HostConfig'].get('NetworkMode') not in ('host', 'none'):
                 await engine.docker('network', 'disconnect', network, before['Id'])
+        await emit(progress, 'recreating', '原容器已保留，正在使用新镜像重建 ' + name, task=reference,
+                   container=name, old_image=before['Image'], new_image=new_image)
         created = await api(engine, endpoint, 'POST', '/containers/create?name=' + quote(name, safe=''), payload, folder)
         tx['new_container'] = created['Id']
         engine.persist()
         await engine.docker('start', tx['new_container'])
+        await emit(progress, 'verifying', '新容器已启动，正在验证镜像 ID、运行状态和健康状态', task=reference)
         await verify_container(engine, tx['new_container'], new_image)
     except (TimeoutError, asyncio.CancelledError):
         tx['status'] = 'needs_review'
@@ -173,6 +179,8 @@ async def update(engine, before, new_image, reference):
         tx['status'] = 'rolling_back'
         engine.persist()
         try:
+            await emit(progress, 'rolling_back', '新容器启动或验证失败，正在恢复原容器 ' + name, task=reference,
+                       container=name, old_image=before['Image'], new_image=new_image)
             if tx['new_container']:
                 await engine.docker('rm', '-f', tx['new_container'])  # Never -v.
             old = await engine.inspect(before['Id'])
@@ -185,6 +193,7 @@ async def update(engine, before, new_image, reference):
                               {'Container': before['Id'], 'EndpointConfig': ep}, folder)
             await engine.docker('update', '--restart', restart_arg(before.get('HostConfig', {}).get('RestartPolicy', {})), before['Id'])
             await engine.docker('start', before['Id'])
+            await emit(progress, 'verifying_rollback', '原容器已重新启动，正在验证回滚结果', task=reference)
             await verify_container(engine, before['Id'], before['Image'])
         except BaseException:
             tx['status'] = 'needs_review'
@@ -202,4 +211,5 @@ async def update(engine, before, new_image, reference):
     if before['Image'] not in engine.state['cleanup_images']:
         engine.state['cleanup_images'].append(before['Image'])
     engine.persist()
-    return 'updated', name + ' 已重建并验证正常；旧容器及旧镜像进入清理队列'
+    return 'updated', (name + f'：确认发现新镜像 {before["Image"][:19]} → {new_image[:19]}；'
+                       '已重建并验证正常，旧容器及旧镜像进入清理队列')
