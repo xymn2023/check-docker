@@ -153,6 +153,16 @@ class ContainerUpdateTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(a[1:3]==['image','rm'] for a in self.fake.calls))
         self.engine.acknowledge('container:web')
 
+    async def test_rollback_progress_is_visible(self):
+        self.fake.new_health='unhealthy'
+        events=[]
+        async def progress(event): events.append(event)
+        await self.engine.check(self.notify, progress=progress)
+        stages=[event['stage'] for event in events]
+        self.assertIn('rolling_back', stages)
+        self.assertIn('verifying_rollback', stages)
+        self.assertLess(stages.index('rolling_back'), stages.index('verifying_rollback'))
+
     async def test_create_failure_restores_old_container(self):
         self.fake.create_failure=True
         rows=await self.engine.check(self.notify)

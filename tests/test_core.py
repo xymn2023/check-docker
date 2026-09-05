@@ -111,10 +111,39 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(applied['services']['web']['volumes'], self.fake.model['services']['web']['volumes'])
         self.assertNotIn('restart', [a[1] for a in self.fake.calls])
 
+    async def test_progress_reports_real_compose_phases_in_order(self):
+        events = []
+        async def progress(event):
+            events.append(event)
+        await self.engine.check(self.notify, progress=progress)
+        stages = [event['stage'] for event in events]
+        for stage in ('checking_task', 'inspecting', 'pulling', 'pulled',
+                      'recreating', 'verifying', 'task_done'):
+            self.assertIn(stage, stages)
+        self.assertLess(stages.index('pulling'), stages.index('recreating'))
+        self.assertLess(stages.index('recreating'), stages.index('verifying'))
+        done = next(event for event in events if event['stage'] == 'task_done')
+        self.assertEqual(done['status'], 'updated')
+
+    async def test_progress_callback_failure_does_not_change_update(self):
+        async def broken_progress(event):
+            raise RuntimeError('telegram edit failed')
+        rows = await self.engine.check(self.notify, progress=broken_progress)
+        self.assertEqual(rows[0]['status'], 'updated')
+        self.assertEqual(self.fake.current['Image'], 'sha256:new')
+
     async def test_already_pulled_still_updates_old_container(self):
         self.fake.tags['demo:latest'] = 'sha256:new'
         rows = await self.engine.check(self.notify)
         self.assertEqual(rows[0]['status'], 'updated')
+
+    async def test_same_running_and_remote_image_is_truthfully_skipped(self):
+        self.fake.current['Image'] = 'sha256:new'
+        self.fake.tags['demo:latest'] = 'sha256:new'
+        rows = await self.engine.check(self.notify)
+        self.assertEqual(rows[0]['status'], 'current')
+        self.assertIn('无更新，已跳过', rows[0]['detail'])
+        self.assertFalse(any('up' in call for call in self.fake.calls))
 
     async def test_no_container_never_reports_success(self):
         self.fake.empty = True
