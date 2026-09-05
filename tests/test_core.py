@@ -16,6 +16,7 @@ class FakeDocker:
     def __init__(self, target):
         self.target = target
         self.tags = {'demo:latest': 'sha256:old'}
+        self.images = {'sha256:old', 'sha256:new'}
         self.current = {'Id': 'container1', 'Name': '/demo-web-1', 'Image': 'sha256:old',
                         'Config': {'Image': 'demo:latest', 'Labels': {'com.docker.compose.project': 'demo',
                                   'com.docker.compose.service': 'web'}},
@@ -52,7 +53,8 @@ class FakeDocker:
             self.current['Id'] += 'x'
             self.current['Image'] = ident
             self.current['Config']['Image'] = ref
-            self.current['State']['Health']['Status'] = 'healthy' if (self.new_healthy if ident == 'sha256:new' else self.old_healthy) else 'unhealthy'
+            if 'Health' in self.current['State']:
+                self.current['State']['Health']['Status'] = 'healthy' if (self.new_healthy if ident == 'sha256:new' else self.old_healthy) else 'unhealthy'
             return ''
         if args[1] == 'ps':
             if self.empty:
@@ -62,7 +64,7 @@ class FakeDocker:
             return json.dumps([self.current])
         if args[1:3] == ['image', 'inspect']:
             ident = self.tags.get(args[3], args[3])
-            return json.dumps([{'Id': ident, 'Os': 'linux', 'Architecture': 'amd64'}])
+            return json.dumps([{'Id': ident, 'Os': 'linux', 'Architecture': 'amd64', 'RepoTags': [t for t, i in self.tags.items() if i == ident]}])
         if args[1] == 'pull':
             if self.pull_gate:
                 await self.pull_gate.wait()
@@ -73,6 +75,13 @@ class FakeDocker:
         if args[1:3] == ['image', 'tag']:
             self.tags[args[-1]] = args[-2]
             return ''
+        if args[1:3] == ['image', 'rm']:
+            ident = self.tags.pop(args[-1], args[-1])
+            if ident not in self.tags.values():
+                self.images.discard(ident)
+            return ''
+        if args[1:3] == ['image', 'ls']:
+            return ' '.join(self.images)
         raise AssertionError(args)
 
 
@@ -152,7 +161,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
     async def test_one_failure_does_not_skip_next_task(self):
         self.engine.save_tasks(['broken', 'compose:web'])
         rows = await self.engine.check(self.notify)
-        self.assertEqual([r['status'] for r in rows], ['error', 'updated'])
+        self.assertEqual([r['status'] for r in rows if r['status'] != 'cleanup'], ['error', 'updated'])
 
     async def test_pull_failure_does_not_apply(self):
         self.fake.pull_fail = True
@@ -160,17 +169,18 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]['status'], 'error')
         self.assertFalse(any('up' in a for a in self.fake.calls))
 
-    async def test_notify_mode_never_recreates(self):
+    async def test_old_notify_setting_now_automatically_updates(self):
         self.target['mode'] = 'notify'
         rows = await self.engine.check(self.notify)
-        self.assertEqual(rows[0]['status'], 'available')
-        self.assertFalse(any('up' in a for a in self.fake.calls))
+        self.assertEqual(rows[0]['status'], 'updated')
+        self.assertTrue(any('up' in a for a in self.fake.calls))
 
-    async def test_ordinary_container_only_notifies(self):
+    async def test_ordinary_container_dispatches_to_automatic_updater(self):
         self.engine.save_tasks(['container:demo-web-1'])
-        rows = await self.engine.check(self.notify)
-        self.assertEqual(rows[0]['status'], 'available')
-        self.assertEqual(self.fake.current['Image'], 'sha256:old')
+        with patch('container_update.update', new=AsyncMock(return_value=('updated', 'ok'))) as updater:
+            rows = await self.engine.check(self.notify)
+        self.assertEqual(rows[0]['status'], 'updated')
+        updater.assert_awaited_once()
 
     async def test_config_drift_cancels_before_apply(self):
         self.fake.config_drift = True
@@ -178,10 +188,10 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]['status'], 'error')
         self.assertFalse(any('up' in a for a in self.fake.calls))
 
-    async def test_missing_healthcheck_rejected_by_default(self):
+    async def test_missing_healthcheck_uses_running_verification(self):
         self.fake.current['State'].pop('Health')
         rows = await self.engine.check(self.notify)
-        self.assertEqual(rows[0]['status'], 'error')
+        self.assertEqual(rows[0]['status'], 'updated')
 
     async def test_cancel_releases_lock(self):
         self.fake.pull_gate = asyncio.Event()
@@ -264,7 +274,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         atomic_json(self.root/'config.json', {'bot_token': 'example', 'chat_id': 1})
         prepare(self.root)
         self.assertEqual(read_json(self.root/'tasks.json', []), original)
-        self.assertEqual(read_json(self.root/'tasks-v2.json', []), ['legacy:example:latest'])
+        self.assertEqual(read_json(self.root/'tasks-v2.json', []), ['image:example:latest'])
 
     async def test_group_configuration_requires_users(self):
         atomic_json(self.root/'config.json', {'bot_token': 'example', 'chat_id': -100})

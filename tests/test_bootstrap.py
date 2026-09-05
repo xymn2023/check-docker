@@ -37,7 +37,7 @@ shutil.copyfile(root/source,args[args.index('-o')+1])
 
     def archive(self, missing=False, traversal=False):
         with tarfile.open(self.root/'source.tar.gz','w:gz') as t:
-            for name in ('install.sh','uninstall.sh','core.py','admin.py','autoupdate_bot.py','requirements.txt','requirements.lock'):
+            for name in ('install.sh','uninstall.sh','core.py','container_update.py','docker_api.py','admin.py','autoupdate_bot.py','requirements.txt','requirements.lock'):
                 if missing and name=='install.sh':
                     continue
                 t.add(ROOT/name, arcname='repo-'+SHA+'/'+name)
