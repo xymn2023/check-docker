@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+config.json
+tasks*.json
+state*.json
+transactions/
+*.zip
+instance.lock
+
+.source-commit
+ready.json
