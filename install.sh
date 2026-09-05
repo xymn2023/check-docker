@@ -108,8 +108,8 @@ EOF
 require_root
 if [[ "${1:-}" == '--install' || ! -f "$SERVICE_FILE" || ! -f "$INSTALL_DIR/config.json" ]]; then install_release; exit; fi
 while true; do
-  echo 'check-docker v2 管理菜单'
-  echo '1. 安装/升级本次获取的版本'
+  echo 'check-docker  管理菜单'
+  echo '1. 安装/升级'
   echo '2. 查看状态'
   echo '3. 查看最近日志'
   echo '4. 验证配置并重启'
